@@ -89,7 +89,11 @@ func TestRenewalRetriesWithoutExiting(t *testing.T) {
 }
 
 func TestTCPStreamSurvivesRenewalAndLostAcknowledgement(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	// Allow real DERP/WireGuard retries on hosted race-test runners. The lease
+	// must exceed bootstrap + rebind + the first renewal, or this tests accidental
+	// expiry during setup rather than preservation of a renewed TCP stream.
+	const lease = 30 * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	relay := derpserver.New(key.NewNode(), t.Logf)
 	httpRelay := httptest.NewTLSServer(derpserver.Handler(relay))
@@ -106,7 +110,7 @@ func TestTCPStreamSurvivesRenewalAndLostAcknowledgement(t *testing.T) {
 			return cp
 		}
 		return nil
-	}, 10*time.Second)
+	}, lease)
 	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{
 		Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none",
 		DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: stun.Port, STUNTestIP: "127.0.0.1", InsecureForTests: true,
@@ -188,14 +192,14 @@ func TestTCPStreamSurvivesRenewalAndLostAcknowledgement(t *testing.T) {
 	node, addr := c.PublicKey(), conn.LocalAddr().String()
 	exchange := func(value uint32) {
 		t.Helper()
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
+		conn.SetDeadline(time.Now().Add(10 * time.Second))
 		var sent, received [4]byte
 		binary.BigEndian.PutUint32(sent[:], value)
 		if _, err := conn.Write(sent[:]); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := io.ReadFull(conn, received[:]); err != nil {
-			t.Fatal(err)
+			t.Fatalf("TCP exchange %d: %v (commits=%d, ackLoss=%v, serverPeers=%d)", value, err, commits.Load(), droppedAck.Load(), len(server.Status().Peer))
 		}
 		if received != sent {
 			t.Fatal("TCP stream corrupted during renewal")
@@ -223,7 +227,7 @@ func TestTCPStreamSurvivesRenewalAndLostAcknowledgement(t *testing.T) {
 	if err := c.RefreshNetwork(); err != nil {
 		t.Fatal(err)
 	}
-	probeCtx, stopProbe := context.WithTimeout(ctx, 3*time.Second)
+	probeCtx, stopProbe := context.WithTimeout(ctx, 10*time.Second)
 	if err := c.Probe(probeCtx); err != nil {
 		t.Fatal(err)
 	}
@@ -240,7 +244,7 @@ func TestTCPStreamSurvivesRenewalAndLostAcknowledgement(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); maintain(renewCtx, c.Renew, 3*time.Second, 200*time.Millisecond, nil) }()
 	defer func() { stopRenewal(); <-done }()
-	until := time.Now().Add(14 * time.Second) // Beyond the original server lease.
+	until := time.Now().Add(lease + 4*time.Second) // Beyond the original server lease.
 	for sequence := uint32(1); time.Now().Before(until); sequence++ {
 		exchange(sequence)
 		time.Sleep(50 * time.Millisecond)
@@ -272,7 +276,7 @@ func TestTCPStreamSurvivesRenewalAndLostAcknowledgement(t *testing.T) {
 	exchange(9999) // Failed renewal must preserve the old live stream.
 	// Simulate sleeping beyond the server lease and UDP flow idle timeout.
 	// Recovery must work with the existing client and connected UDP socket.
-	expiryDeadline := time.Now().Add(12 * time.Second)
+	expiryDeadline := time.Now().Add(lease + 2*time.Second)
 	for len(server.Status().Peer) != 0 && time.Now().Before(expiryDeadline) {
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -285,7 +289,7 @@ func TestTCPStreamSurvivesRenewalAndLostAcknowledgement(t *testing.T) {
 	if err := c.Renew(ctx); err != nil {
 		t.Fatal(err)
 	}
-	probeCtx, stopProbe = context.WithTimeout(ctx, 3*time.Second)
+	probeCtx, stopProbe = context.WithTimeout(ctx, 10*time.Second)
 	if err := c.Probe(probeCtx); err != nil {
 		t.Fatal(err)
 	}
