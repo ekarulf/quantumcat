@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ekarulf.qcat-server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/ekarulf/.local/bin/qcat</string>
+        <string>--config</string>
+        <string>/Users/ekarulf/.config/qcat</string>
+        <string>serve</string>
+        <string>--tcp</string>
+        <string>22=127.0.0.1:22</string>
+        <string>--udp</string>
+        <string>60001=127.0.0.1:60001</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>QCAT_SE_HELPER</key>
+        <string>/Users/ekarulf/.local/bin/qcat-se</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/ekarulf/Library/Logs/qcat-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/ekarulf/Library/Logs/qcat-server.log</string>
+</dict>
+</plist>

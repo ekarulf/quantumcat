@@ -1,0 +1,128 @@
+# Quantumcat bootstrap v1
+
+Network frames: ASCII `QCAT`, version byte `1`, message-type byte, big-endian
+uint16 payload length, payload. The header is eight bytes. Hard limit: 32768
+bytes. Every type has an exact size; reject unknown types, versions, and trailing
+bytes. All integers use big-endian encoding.
+
+| Type | Payload, in order | Bytes |
+| --- | --- | --- |
+| 1 ClientHello | client PeerID (32), WG public (32), disco public (32), nonce (32), server PeerID (32), reserved zeros (32), Unix timestamp (8), KEM public (1568), signature (4627) | 6395 |
+| 2 ServerHello | server PeerID (32), WG public (32), disco public (32), nonce (32), ciphertext (1568), signature (4627), server proof (32) | 6355 |
+| 3 ClientFinish | transcript hash (32), client proof (32) | 64 |
+| 4 ServerAccepted | transcript hash (32), acknowledgement proof (32) | 64 |
+
+ClientHello signs its unsigned frame, whose header payload length is **1768**
+(not the transmitted length 6395), with ML-DSA context
+`qcat-handshake-client-v1`. Reserved bytes must be zero.
+Public ML-DSA keys are 2592 bytes, obtained from the local pairing store.
+PeerID is SHA-256 of `qcat-peer-v1` followed by that key. Text IDs use
+`qpeer:` plus unpadded uppercase RFC 4648 base32. All 32 bytes are retained.
+
+Transcript hash is SHA-256 over this fixed concatenation:
+
+```text
+"qcat-transcript-v1" || version_byte ||
+server_peer_id || client_peer_id ||
+server_wg_public || client_wg_public ||
+server_disco_public || client_disco_public ||
+client_kem_public || kem_ciphertext ||
+client_nonce || server_nonce
+```
+
+ServerHello signs the 32-byte hash with context `qcat-handshake-server-v1`.
+HKDF-SHA256 extracts the ML-KEM secret using the transcript hash as salt.
+Expand separate 32-byte keys with `qcat-wireguard-psk-v1` and
+`qcat-handshake-confirm-v1`. Proofs use HMAC-SHA256 under the confirmation
+key over a label followed by the transcript hash. Labels:
+`server-finished`, `client-finished`, `server-accepted`.
+
+The DERP source must equal the signed client WG key. The client checks the
+server identity and transport keys against its paired descriptor. Timestamps
+allow ±120 seconds. Authenticated nonces enter a five-minute replay cache.
+Exact duplicate ClientHellos receive a cached response without re-encapsulation.
+
+Pending state expires after 30 seconds, including acknowledgement retry state.
+Clients have a 25-second budget and retry once per second. ClientFinish includes
+the transcript hash to identify the session. Type 4 is an authenticated
+acknowledgement, replacing the design's optional Error message. This handles
+lost finishes without premature client peer installation. Repeated finishes
+resend the acknowledgement without reinstalling a peer.
+
+The server installs the peer after ClientFinish verification; the client waits
+for ServerAccepted. Legacy Meow packets never authorize a Quantumcat peer.
+Failures are silent to unauthenticated senders.
+
+Limits: a 64-packet serialized server queue, 64 known-peer hellos/second globally,
+four/second per PeerID and source key, 256 pending handshakes, 4096 replay/rate
+entries, and 4096 installed sessions. Unknown peers trigger no signature work,
+encapsulation, filesystem I/O, or peer installation. Installed sessions expire
+after one hour. Revocation is checked before key confirmation and during use.
+
+## Swift helper
+
+Inherited stdin/stdout carry a big-endian uint32 length, one operation byte,
+and payload (maximum 32768 bytes). Replies use the same framing with a status
+byte (0 success, 1 error) and result. Errors are bounded UTF-8 text.
+
+| Operation | Input | Result |
+| --- | --- | --- |
+| 1 GenerateIdentity | empty | opaque dataRepresentation |
+| 2 LoadIdentity | dataRepresentation | empty |
+| 3 GetIdentityPublicKey | empty | public key |
+| 4 Sign | uint8 context length, context, message | signature |
+| 5 GenerateEphemeralKEM | empty | empty |
+| 6 GetKEMPublicKey | empty | public key |
+| 7 Decapsulate | ciphertext | shared secret |
+| 8 DestroyKEM | empty | empty |
+| 9 Capabilities | empty | capability text |
+
+Each KEM helper process owns one ephemeral key. Decapsulation discards it;
+closing the process also destroys it. Persistent identity storage contains
+only Apple's opaque representation, in a mode-0600 file. There is no operation
+to export a Secure Enclave private key and no network listener.
+
+## Published UDP services
+
+`serve --udp PORT=HOST:PORT` exposes an operator-selected destination to paired
+clients. The destination is never taken from a datagram. Each local sender
+IP:port gets a distinct connected tunnel UDP socket.
+
+Application datagrams are framed **inside WireGuard**, using the published UDP
+port. This accommodates messages larger than Tailcat's 1232-byte payload limit;
+it does not add encryption or reliability. Raw packets from another Tailcat
+application are not this service protocol.
+
+Each fragment has a 16-byte header:
+
+| Field | Bytes |
+| --- | --- |
+| ASCII `QUD1` (includes framing version) | 4 |
+| Datagram ID, big-endian uint64 | 8 |
+| Original payload length, big-endian uint16 | 2 |
+| Zero-based fragment index, big-endian uint16 | 2 |
+
+Fragments carry up to 1056 payload bytes, so a frame is at most 1072 bytes.
+All non-final fragments have exactly 1056 bytes; the final one contains exactly
+the remaining length. Empty datagrams use index 0 with no payload. IDs begin
+at a random 64-bit value per socket and increment per datagram. Original
+payloads are limited to 65,507 bytes (at most 63 fragments).
+
+This conservatively caps each direct-path encrypted IPv6 packet at 1200 bytes:
+40 outer IPv6 + 8 outer UDP + 32 WireGuard header/tag + 1120 padded inner packet.
+The inner packet contains 40 IPv6 + 8 UDP + up to 1072 framing/payload bytes.
+WireGuard pads to 16-byte boundaries; the 1120-byte budget is already aligned.
+Normal outer IPv4 packets are smaller. This budget covers the forwarded UDP
+data path, not TCP services, network-layer extensions, or DERP/TLS stream packets.
+
+Reassembly is per socket, handles out-of-order fragments, and ignores duplicate
+fragments of incomplete datagrams. At most eight incomplete datagrams are
+retained per flow. Entries have a fixed two-second deadline checked on incoming
+frames; the oldest entry is evicted when capacity is reached. Idle-flow shutdown
+also releases reassembly state. Invalid versions, sizes, indices, and trailing
+data are dropped before allocating an assembly.
+
+There are no acknowledgements or retries. Missing fragments cause loss of that
+datagram, never delivery of a partial message. Complete duplicate datagrams may
+still be delivered; the application owns replay handling. This framing does not
+change the bootstrap or WireGuard protocol.
