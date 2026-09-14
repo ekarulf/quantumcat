@@ -19,7 +19,10 @@ import (
 )
 
 func TestPublishedUDPForwarding(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// This is the lifetime of the services, not an individual operation's
+	// deadline. A slow DERP bootstrap must not tear down otherwise healthy
+	// forwarding partway through the packet-size checks.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	relay := derpserver.New(key.NewNode(), t.Logf)
 	httpRelay := httptest.NewTLSServer(derpserver.Handler(relay))
@@ -80,8 +83,18 @@ func TestPublishedUDPForwarding(t *testing.T) {
 	}
 	defer c.Close()
 	c.Logf = t.Logf
-	if _, err = c.Ping(ctx); err != nil {
-		t.Fatal(err)
+	startupCtx, stopStartup := context.WithTimeout(ctx, 45*time.Second)
+	_, err = c.Ping(startupCtx)
+	stopStartup()
+	if err != nil {
+		t.Fatalf("UDP test bootstrap: %v", err)
+	}
+	// Ping authenticates; Probe also establishes the encrypted data path.
+	probeCtx, stopProbe := context.WithTimeout(ctx, 15*time.Second)
+	err = c.Probe(probeCtx)
+	stopProbe()
+	if err != nil {
+		t.Fatalf("UDP test data-path readiness: %v", err)
 	}
 	local, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -121,19 +134,26 @@ func TestPublishedUDPForwarding(t *testing.T) {
 	}
 	defer b.Close()
 	sent := map[*net.UDPConn][][]byte{}
-	exchange := func(socket *net.UDPConn, payload []byte) byte {
+	exchange := func(name string, socket *net.UDPConn, payload []byte) byte {
 		t.Helper()
 		buf := make([]byte, 65535)
 		sent[socket] = append(sent[socket], append([]byte{}, payload...))
-		// Initial UDP datagrams may be dropped while WireGuard establishes its session.
-		for attempt := 0; attempt < 10; attempt++ {
-			socket.SetDeadline(time.Now().Add(500 * time.Millisecond))
+		// UDP can drop packets during path changes. Bound each exchange
+		// independently; retries here belong to the test, not the forwarder.
+		deadline := time.Now().Add(10 * time.Second)
+		var lastErr error
+		for time.Now().Before(deadline) && ctx.Err() == nil {
+			socket.SetDeadline(minTime(deadline, time.Now().Add(500*time.Millisecond)))
 			if _, err := socket.Write(payload); err != nil {
-				t.Fatal(err)
+				t.Fatalf("%s write (%d bytes): %v", name, len(payload), err)
 			}
 			for {
 				n, err := socket.Read(buf)
 				if err != nil {
+					lastErr = err
+					if e, ok := err.(net.Error); !ok || !e.Timeout() {
+						t.Fatalf("%s read (%d bytes): %v", name, len(payload), err)
+					}
 					break
 				}
 				if n == len(payload)+1 && bytes.Equal(buf[1:n], payload) {
@@ -154,20 +174,20 @@ func TestPublishedUDPForwarding(t *testing.T) {
 				}
 			}
 		}
-		t.Fatal("no UDP response through WireGuard")
+		t.Fatalf("%s: no UDP response through WireGuard for %d bytes (service context: %v; last read: %v)", name, len(payload), ctx.Err(), lastErr)
 		return 0
 	}
 	// Zero-length datagrams must open a flow and reach the destination.
-	tokenA := exchange(a, nil)
-	tokenB := exchange(b, []byte("client B"))
+	tokenA := exchange("client A", a, nil)
+	tokenB := exchange("client B", b, []byte("client B"))
 	if tokenA == tokenB {
 		t.Fatal("local senders shared the same remote UDP socket")
 	}
 	for _, size := range []int{1, 1200, 1220, 1221, 1232, 1280, 4096, 8192} {
-		if token := exchange(a, bytes.Repeat([]byte{0xa1}, size)); token != tokenA {
+		if token := exchange("client A", a, bytes.Repeat([]byte{0xa1}, size)); token != tokenA {
 			t.Fatal("client A changed flows")
 		}
-		if token := exchange(b, bytes.Repeat([]byte{0xb2}, size)); token != tokenB {
+		if token := exchange("client B", b, bytes.Repeat([]byte{0xb2}, size)); token != tokenB {
 			t.Fatal("client B changed flows")
 		}
 	}
@@ -186,4 +206,11 @@ func TestPublishedUDPForwarding(t *testing.T) {
 	if forbiddenDeliveries.Load() != 0 {
 		t.Fatal("unpublished service reached configured destination")
 	}
+}
+
+func minTime(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
