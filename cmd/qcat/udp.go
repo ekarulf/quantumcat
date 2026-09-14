@@ -38,17 +38,38 @@ func udpServiceSpecs(entries []string) (map[uint16]string, error) {
 		if !ok {
 			return nil, errors.New("--udp requires PORT=HOST:PORT")
 		}
-		port, err := strconv.ParseUint(p, 10, 16)
-		if err != nil || port == 0 {
+		firstText, lastText, ranged := strings.Cut(p, ":")
+		first, err := strconv.ParseUint(firstText, 10, 16)
+		if err != nil || first == 0 {
 			return nil, errors.New("UDP service port must be 1–65535")
+		}
+		last := first
+		if ranged {
+			last, err = strconv.ParseUint(lastText, 10, 16)
+			if err != nil || last < first {
+				return nil, errors.New("UDP range must be FIRST:LAST with 1 <= FIRST <= LAST <= 65535")
+			}
 		}
 		if err = proxy.ValidateTarget(target); err != nil {
 			return nil, err
 		}
-		if _, exists := targets[uint16(port)]; exists {
-			return nil, fmt.Errorf("duplicate UDP service port %d", port)
+		host, baseText, _ := net.SplitHostPort(target) // Validated above.
+		base, _ := strconv.ParseUint(baseText, 10, 16)
+		if base+last-first > 65535 {
+			return nil, errors.New("UDP destination range exceeds port 65535")
 		}
-		targets[uint16(port)] = target
+		// A range maps consecutive tunnel ports to consecutive destination ports,
+		// starting at HOST:PORT. uint64 counters avoid wrapping at port 65535.
+		for port := first; port <= last; port++ {
+			if _, exists := targets[uint16(port)]; exists {
+				return nil, fmt.Errorf("duplicate UDP service port %d", port)
+			}
+			mapped := target
+			if ranged {
+				mapped = net.JoinHostPort(host, strconv.FormatUint(base+port-first, 10))
+			}
+			targets[uint16(port)] = mapped
+		}
 	}
 	return targets, nil
 }

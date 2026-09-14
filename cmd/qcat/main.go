@@ -36,12 +36,15 @@ qcat [--config DIR] identity show
 qcat [--config DIR] peer add NAME FILE.qpeer
 qcat [--config DIR] peer list|show NAME|remove NAME
 qcat [--config DIR] serve [--tcp PORT=HOST:PORT] [--udp PORT=HOST:PORT]
+                         [--udp FIRST:LAST=HOST:BASE]
                          [--allow-target HOST:PORT] [--udp-idle-timeout 2m]
                          [--region ID] [--derp-map URL] [--export FILE.qpeer]
 qcat [--config DIR] forward PEER LOCALPORT:HOST:PORT
 qcat [--config DIR] forward --udp [--udp-idle-timeout 2m] PEER LOCALPORT:TUNNELPORT
 qcat [--config DIR] socks [--listen 127.0.0.1:1080] PEER
 qcat [--config DIR] connect PEER PORT
+qcat [--config DIR] mosh [--ssh-host HOST] [--server-port PORT] [--tunnel-port PORT]
+                        [--local-port 0] [--mosh-server PATH] PEER [-- COMMAND...]
 qcat [--config DIR] up PEER
 qcat [--config DIR] serve --tun [--export FILE.qpeer]
 qcat [--config DIR] status
@@ -92,6 +95,8 @@ func run(ctx context.Context, args []string) error {
 		return peers(s, args[1:])
 	case "serve":
 		return serve(ctx, s, args[1:])
+	case "mosh":
+		return mosh(ctx, s, args[1:])
 	case "forward", "socks", "connect", "up":
 		return client(ctx, s, args[0], args[1:])
 	case "status":
@@ -205,7 +210,7 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 	f := flags("serve")
 	var tcp, udp, allow repeated
 	f.Var(&tcp, "tcp", "PORT=HOST:PORT (repeatable)")
-	f.Var(&udp, "udp", "UDP PORT=HOST:PORT (repeatable, explicit destinations only)")
+	f.Var(&udp, "udp", "UDP PORT=HOST:PORT or FIRST:LAST=HOST:BASE (repeatable, explicit destinations only)")
 	udpIdle := f.Duration("udp-idle-timeout", proxy.DefaultUDPIdleTimeout, "close inactive UDP flows after this duration")
 	f.Var(&allow, "allow-target", "SOCKS target (repeatable, exact match)")
 	region := f.Int("region", 0, "DERP region ID")
@@ -238,6 +243,9 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 		}
 		if err = proxy.ValidateTarget(target); err != nil {
 			return err
+		}
+		if _, exists := targets[uint16(port)]; exists {
+			return fmt.Errorf("duplicate TCP service port %d", port)
 		}
 		targets[uint16(port)] = target
 		allowed[target] = true
@@ -338,11 +346,17 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 	if err = emit(descriptor); err != nil {
 		return err
 	}
+	var identityDone <-chan struct{}
+	if monitored, ok := i.(interface{ Done() <-chan struct{} }); ok {
+		identityDone = monitored.Done()
+	}
 	// Reload pairing on every tick. A malformed file fails closed.
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
 		select {
+		case <-identityDone:
+			return errors.New("identity helper exited; restart qcat to reload the identity")
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
@@ -360,7 +374,7 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 	}
 }
 func client(ctx context.Context, s config.Store, command string, args []string) error {
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := clientContext(ctx)
 	defer cancel()
 	f := flags(command)
 	listen := f.String("listen", "127.0.0.1:1080", "local SOCKS listen address")
@@ -398,11 +412,11 @@ func client(ctx context.Context, s config.Store, command string, args []string) 
 	if p.Endpoint == "" {
 		return errors.New("peer has no endpoint; pair the server's serve --export descriptor")
 	}
-	i, kem, _, close, err := s.Identity(ctx)
+	i, kem, _, closeIdentity, err := s.Identity(ctx)
 	if err != nil {
 		return err
 	}
-	defer close()
+	defer closeIdentity()
 	c, err := transport.Client(i, kem, p.PublicKey, p.Endpoint)
 	if err != nil {
 		return err
@@ -427,13 +441,22 @@ func client(ctx context.Context, s config.Store, command string, args []string) 
 	if _, err = c.Ping(ctx); err != nil {
 		return err
 	}
+	renewCtx, stopRenewal := context.WithCancel(ctx)
+	renewDone := make(chan struct{})
+	go func() {
+		defer close(renewDone)
+		transport.Maintain(renewCtx, c, func(err error) {
+			fmt.Fprintln(os.Stderr, "qcat: tunnel recovery/renewal failed; retrying:", err)
+		})
+	}()
+	defer func() { stopRenewal(); <-renewDone }()
 	if command != "connect" {
 		name := command + "-" + args[0]
 		if *udp {
 			_, port, _ := net.SplitHostPort(udpListen)
 			name = "forward-udp-" + port + "-" + args[0]
 		}
-		closeControl, err := control.Start(ctx, s.Dir, name, func() any { return c.Status() }, cancel)
+		closeControl, err := control.StartPeer(ctx, s.Dir, name, args[0], func() any { return c.Status() }, cancel)
 		if err != nil {
 			return err
 		}

@@ -13,8 +13,12 @@ import (
 )
 
 func TestSecureEnclaveCIRCLInteroperability(t *testing.T) {
-	if os.Getenv("QCAT_TEST_SE") != "1" {
-		t.Skip("set QCAT_TEST_SE=1 and QCAT_SE_HELPER to exercise Apple hardware")
+	enabled, configured := os.LookupEnv("QCAT_TEST_ENCLAVE")
+	if !configured {
+		enabled = os.Getenv("QCAT_TEST_SE")
+	}
+	if enabled != "1" {
+		t.Skip("set QCAT_TEST_ENCLAVE=1 and QCAT_ENCLAVE_HELPER to exercise Apple hardware")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -75,4 +79,5 @@ func TestSecureEnclaveCIRCLInteroperability(t *testing.T) {
 	if session == nil || session.PSK != psk || !c.Accepted(ack) {
 		t.Fatal("Apple/CIRCL KEM key confirmation failed")
 	}
+	session.Installed(true)
 }

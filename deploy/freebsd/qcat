@@ -1,0 +1,35 @@
+#!/bin/sh
+# PROVIDE: qcat
+# REQUIRE: NETWORKING LOGIN
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name=qcat
+rcvar=qcat_enable
+load_rc_config "$name"
+: ${qcat_enable:="NO"}
+
+command=/usr/sbin/daemon
+procname=/usr/sbin/daemon
+pidfile=/var/run/qcat/supervisor.pid
+required_files=/usr/local/etc/qcat/identity.json
+start_precmd=qcat_prestart
+# Stop the supervisor, not just the child, so an intentional stop stays stopped.
+command_args="-c -f -H -R 5 -P ${pidfile} -p /var/run/qcat/child.pid -o /var/log/qcat/qcat.log -M 0600 -u qcat -- /usr/local/bin/qcat --config /usr/local/etc/qcat serve --tcp 22=127.0.0.1:22 --udp 60000:61000=127.0.0.1:60000"
+
+qcat_prestart()
+{
+    umask 077
+    ulimit -c 0
+    [ "$(id -u qcat)" != 0 ] || return 1
+    [ ! -L /usr/local/etc/qcat/identity.json ] || return 1
+    [ "$(stat -f '%Su:%Sg:%Lp' /usr/local/etc/qcat/identity.json)" = qcat:qcat:600 ] || {
+        warn "qcat identity must be owned by qcat:qcat with mode 0600"
+        return 1
+    }
+    install -d -o root -g wheel -m 0750 /var/run/qcat /var/log/qcat
+    install -d -o qcat -g qcat -m 0700 /usr/local/etc/qcat/run
+}
+
+run_rc_command "$1"

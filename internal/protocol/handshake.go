@@ -119,15 +119,19 @@ type Session struct {
 	Peer PeerID
 	Keys Keys
 	PSK  [32]byte
+	// Installed must be called exactly once after transport installation. Failure
+	// invalidates retry state; success permits cached acceptance acknowledgements.
+	Installed func(bool)
 }
 type pending struct {
-	session   Session
-	hash, hk  [32]byte
-	source    [32]byte
-	expires   time.Time
-	accepted  bool
-	helloHash [32]byte
-	response  []byte
+	session    Session
+	hash, hk   [32]byte
+	source     [32]byte
+	expires    time.Time
+	accepted   bool
+	installing bool
+	helloHash  [32]byte
+	response   []byte
 }
 type bucket struct {
 	start time.Time
@@ -139,11 +143,12 @@ type Server struct {
 	Public   []byte
 	Keys     Keys
 	// Lookup must use the full PeerID and return nil for revoked/unknown peers.
-	Lookup  func(PeerID) []byte
-	pending map[[32]byte]*pending
-	replay  map[[32]byte]time.Time
-	limits  map[[32]byte]bucket
-	global  bucket
+	Lookup     func(PeerID) []byte
+	pending    map[[32]byte]*pending
+	replay     map[[32]byte]time.Time
+	limits     map[[32]byte]bucket
+	peerLimits map[[32]byte]bucket
+	global     bucket
 }
 
 // Expire erases pending secrets even when the server receives no traffic.
@@ -173,6 +178,7 @@ func (s *Server) Close() {
 	}
 	clear(s.replay)
 	clear(s.limits)
+	clear(s.peerLimits)
 }
 
 func allow(b bucket, now time.Time, max int) (bucket, bool) {
@@ -204,9 +210,11 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 			delete(s.replay, h)
 		}
 	}
-	for h, t := range s.limits {
-		if now.Sub(t.start) > time.Minute {
-			delete(s.limits, h)
+	for _, limits := range []map[[32]byte]bucket{s.limits, s.peerLimits} {
+		for h, t := range limits {
+			if now.Sub(t.start) > time.Minute {
+				delete(limits, h)
+			}
 		}
 	}
 	if kind == ClientFinish {
@@ -219,9 +227,28 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		if p.accepted {
 			return ack, nil
 		}
+		if p.installing {
+			return nil, nil
+		}
 		session := p.session
-		clear(p.session.PSK[:])
-		p.accepted = true
+		p.installing = true
+		var once sync.Once
+		session.Installed = func(ok bool) {
+			once.Do(func() {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				if s.pending[h] != p {
+					return
+				}
+				clear(p.session.PSK[:])
+				if ok {
+					p.accepted = true
+				} else {
+					clear(p.hk[:])
+					delete(s.pending, h)
+				}
+			})
+		}
 		return ack, &session
 	}
 	if kind != ClientHello {
@@ -237,21 +264,22 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		return nil, nil
 	}
 	var ok bool
-	s.global, ok = allow(s.global, now, 64)
+	if s.limits == nil {
+		s.limits = make(map[[32]byte]bucket)
+		s.peerLimits = make(map[[32]byte]bucket)
+	}
+	if _, exists := s.limits[source]; !exists && len(s.limits) >= 4096 {
+		return nil, nil
+	}
+	// Charge a sender's quota before the shared verification budget. Claimed
+	// identities must not consume another device's quota before authentication.
+	s.limits[source], ok = allow(s.limits[source], now, 4)
 	if !ok {
 		return nil, nil
 	}
-	if s.limits == nil {
-		s.limits = make(map[[32]byte]bucket)
-	}
-	if len(s.limits) >= 4096 {
+	s.global, ok = allow(s.global, now, 64)
+	if !ok {
 		return nil, nil
-	}
-	for _, key := range [][32]byte{source, [32]byte(id)} {
-		s.limits[key], ok = allow(s.limits[key], now, 4)
-		if !ok {
-			return nil, nil
-		}
 	}
 	replay := sha256.Sum256(join(id[:], b[96:128]))
 	if _, ok := s.replay[replay]; ok {
@@ -268,6 +296,13 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	}
 	hello := b[:helloSize]
 	if !verify(pub, ClientContext, frame(ClientHello, hello), b[helloSize:]) {
+		return nil, nil
+	}
+	if _, exists := s.peerLimits[[32]byte(id)]; !exists && len(s.peerLimits) >= 4096 {
+		return nil, nil
+	}
+	s.peerLimits[[32]byte(id)], ok = allow(s.peerLimits[[32]byte(id)], now, 4)
+	if !ok {
 		return nil, nil
 	}
 	kp, err := mlkem1024.Scheme().UnmarshalBinaryPublicKey(hello[200:])
@@ -299,7 +334,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		s.replay = make(map[[32]byte]time.Time)
 	}
 	response := frame(ServerHello, join(sid[:], s.Keys.WG[:], s.Keys.Disco[:], nonce, ct, sig, proof(hk, "server-finished", hash)))
-	s.pending[hash] = &pending{session: Session{id, Keys{[32]byte(b[32:64]), [32]byte(b[64:96])}, psk}, hash: hash, hk: hk, source: source, expires: now.Add(30 * time.Second), helloHash: sha256.Sum256(packet), response: response}
+	s.pending[hash] = &pending{session: Session{Peer: id, Keys: Keys{[32]byte(b[32:64]), [32]byte(b[64:96])}, PSK: psk}, hash: hash, hk: hk, source: source, expires: now.Add(30 * time.Second), helloHash: sha256.Sum256(packet), response: response}
 	s.replay[replay] = now.Add(5 * time.Minute)
 	return response, nil
 }

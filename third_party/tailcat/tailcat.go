@@ -336,6 +336,7 @@ type locoBackend struct {
 	tunDevice        tun.Device
 	tunnelPeer       func(key.NodePublic, bool) error
 	peerValid        map[key.NodePublic]func() bool
+	peerOwners       map[key.NodePublic][32]byte
 	nextClientID     int
 	bootstrapDone    chan struct{}
 	authenticated    bool
@@ -648,6 +649,7 @@ func (s *Server) Start() error {
 		lb.authenticated = true
 		lb.peerPSKs = make(map[key.NodePublic]PresharedKey)
 		lb.peerValid = make(map[key.NodePublic]func() bool)
+		lb.peerOwners = make(map[key.NodePublic][32]byte)
 	}
 	type incoming struct {
 		region tailcfg.DERPRegionID
@@ -677,6 +679,7 @@ func (s *Server) Start() error {
 						if valid == nil || !valid() {
 							delete(lb.peerPSKs, k)
 							delete(lb.peerValid, k)
+							delete(lb.peerOwners, k)
 							delete(lb.clients, k)
 							removed = append(removed, k)
 						}
@@ -702,33 +705,67 @@ func (s *Server) Start() error {
 				case p = <-inbox:
 				}
 				reply, peer := s.Bootstrap(p.src, p.packet)
-				if peer != nil && !peer.PSK.IsZero() && peer.Valid != nil && peer.Valid() {
+				if peer != nil {
+					finishInstallation := func(installed bool) {
+						clear(peer.PSK[:])
+						if peer.Installed != nil {
+							peer.Installed(installed)
+						}
+					}
+					if peer.PSK.IsZero() || peer.Valid == nil || !peer.Valid() {
+						finishInstallation(false)
+						continue
+					}
 					lb.mu.Lock()
 					_, exists := lb.peerPSKs[p.src]
+					if exists {
+						n := lb.clients[p.src]
+						valid := lb.peerValid[p.src]
+						// Renewal may only refresh an active session belonging to the
+						// same PQ identity and discovery key. Never recreate its sockets.
+						ok := peer.Identity != [32]byte{} && lb.peerOwners[p.src] == peer.Identity &&
+							n != nil && n.DiscoKey == peer.Disco && valid != nil && valid()
+						if ok {
+							lb.peerPSKs[p.src] = peer.PSK
+							lb.peerValid[p.src] = peer.Valid
+						}
+						lb.mu.Unlock()
+						if !ok {
+							finishInstallation(false)
+							continue
+						}
+						lb.sys.Engine.Get().SyncDevicePeer(p.src)
+						finishInstallation(true)
+						if len(reply) > 0 {
+							lb.sys.MagicSock.Get().SendDERPPacketTo(p.src, p.region, reply)
+						}
+						continue
+					}
 					full := len(lb.peerPSKs) >= 4096
 					if !exists && !full {
 						lb.peerPSKs[p.src] = peer.PSK
 						lb.peerValid[p.src] = peer.Valid
+						lb.peerOwners[p.src] = peer.Identity
 					}
 					lb.mu.Unlock()
 					clear(peer.PSK[:])
 					if exists || full {
+						finishInstallation(false)
 						continue
 					}
 					if !lb.onMeow(p.src, peer.Disco) {
+						lb.removeAuthenticatedPeer(p.src)
+						finishInstallation(false)
 						continue
 					}
 					if lb.tunnelPeer != nil {
 						if err := lb.tunnelPeer(p.src, true); err != nil {
-							lb.mu.Lock()
-							delete(lb.clients, p.src)
-							delete(lb.peerPSKs, p.src)
-							delete(lb.peerValid, p.src)
-							lb.mu.Unlock()
-							lb.sys.Engine.Get().SyncDevicePeer(p.src)
+							lb.removeAuthenticatedPeer(p.src)
+							finishInstallation(false)
 							continue
 						}
 					}
+					finishInstallation(true)
 				}
 				if len(reply) > 0 {
 					lb.sys.MagicSock.Get().SendDERPPacketTo(p.src, p.region, reply)
@@ -1820,10 +1857,31 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	return true
 }
 
+// removeAuthenticatedPeer rolls back all networking state after a failed install.
+func (b *locoBackend) removeAuthenticatedPeer(k key.NodePublic) {
+	b.mu.Lock()
+	delete(b.clients, k)
+	delete(b.peerPSKs, k)
+	delete(b.peerValid, k)
+	delete(b.peerOwners, k)
+	if b.nm != nil {
+		nm := *b.nm
+		nm.Peers = nil
+		for _, peer := range b.clients {
+			nm.Peers = append(nm.Peers, peer.View())
+		}
+		b.nm = &nm
+		b.sys.MagicSock.Get().SetNetworkMap(nm.SelfNode, nm.Peers)
+		b.sys.Netstack.Get().UpdateNetstackIPs(&nm)
+	}
+	b.mu.Unlock()
+	b.sys.Engine.Get().SyncDevicePeer(k)
+}
+
 func (b *locoBackend) Status() *ipnstate.Status {
 	mc := b.sys.MagicSock.Get()
 	eng := b.sys.Engine.Get()
-	var sb ipnstate.StatusBuilder
+	sb := ipnstate.StatusBuilder{WantPeers: true}
 	mc.UpdateStatus(&sb)
 	eng.UpdateStatus(&sb)
 	return sb.Status()
@@ -1946,8 +2004,10 @@ type Client struct {
 	serverAddr netip.Addr
 
 	startMu sync.Mutex      // guards key, started, and the one-time startup work
+	renewMu sync.Mutex      // serializes renewal and Close without blocking status
 	key     key.NodePrivate // the effective node identity; Key or generated
 	started bool
+	closed  bool
 
 	upDone atomic.Bool // whether the server has meowed us at least once
 }
@@ -2123,8 +2183,11 @@ func (c *Client) PublicKey() key.NodePublic {
 
 // Close shuts down the client, closing the WireGuard engine and DERP connections.
 func (c *Client) Close() error {
+	c.renewMu.Lock()
+	defer c.renewMu.Unlock()
 	c.startMu.Lock()
 	defer c.startMu.Unlock()
+	c.closed = true
 	if c.lb == nil {
 		return nil // never used
 	}
@@ -2147,6 +2210,9 @@ type PingResult struct {
 func (c *Client) ensureStarted(ctx context.Context) error {
 	c.startMu.Lock()
 	defer c.startMu.Unlock()
+	if c.closed {
+		return errors.New("client is closed")
+	}
 	if c.started {
 		return nil
 	}

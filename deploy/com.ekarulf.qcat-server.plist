@@ -13,7 +13,7 @@
         <string>--tcp</string>
         <string>22=127.0.0.1:22</string>
         <string>--udp</string>
-        <string>60001=127.0.0.1:60001</string>
+        <string>60000:61000=127.0.0.1:60000</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -25,7 +25,7 @@
     <string>Interactive</string>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>QCAT_SE_HELPER</key>
+        <key>QCAT_ENCLAVE_HELPER</key>
         <string>/Users/ekarulf/.local/bin/qcat-se</string>
     </dict>
     <key>StandardOutPath</key>

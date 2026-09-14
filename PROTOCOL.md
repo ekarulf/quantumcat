@@ -48,16 +48,35 @@ the transcript hash to identify the session. Type 4 is an authenticated
 acknowledgement, replacing the design's optional Error message. This handles
 lost finishes without premature client peer installation. Repeated finishes
 resend the acknowledgement without reinstalling a peer.
+Acceptance is committed only after transport and any TUN route installation
+succeed. Installation failure erases the pending keys and acknowledgement state;
+repeated finishes cannot turn a failed installation into a successful handshake.
 
 The server installs the peer after ClientFinish verification; the client waits
 for ServerAccepted. Legacy Meow packets never authorize a Quantumcat peer.
 Failures are silent to unauthenticated senders.
 
-Limits: a 64-packet serialized server queue, 64 known-peer hellos/second globally,
-four/second per PeerID and source key, 256 pending handshakes, 4096 replay/rate
-entries, and 4096 installed sessions. Unknown peers trigger no signature work,
+Limits: a 64-packet serialized server queue, four hellos/second per source before
+the shared 64-verifications/second budget, and four new handshakes/second per
+PeerID only after signature verification. Invalid signatures cannot consume
+the claimed identity's quota. There are 256 pending handshakes, 4096 replay
+entries, 4096 entries in each separate source/identity rate table, and 4096
+installed sessions. The global budget is a resource bound, not a guarantee
+against distributed denial of service. Unknown peers trigger no signature work,
 encapsulation, filesystem I/O, or peer installation. Installed sessions expire
 after one hour. Revocation is checked before key confirmation and during use.
+CLI clients renew every 45 minutes with a fresh nonce and ephemeral ML-KEM key,
+using the same WireGuard node/discovery keys. The server permits replacement of
+an active node's PSK and lease only for the same authenticated PQ identity and
+discovery key. Duplicate finishes only resend their acknowledgement; they never
+extend a lease or reinstall an older PSK. Revoked identities cannot renew.
+
+The server updates the peer's PSK in place before acknowledging; the client
+updates its PSK after the authenticated acknowledgement and schedules a fresh
+WireGuard handshake on the next user packet. Existing WireGuard traffic keys
+are retained through the transition. Node addresses, routes, netstack and TCP/
+UDP sockets are not recreated. Failed client attempts retry after five seconds;
+there is no process-lifetime deadline. Both endpoints require renewal support.
 
 ## Swift helper
 

@@ -12,10 +12,16 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
 func Start(ctx context.Context, dir, name string, status func() any, stop func()) (func(), error) {
+	return StartPeer(ctx, dir, name, "", status, stop)
+}
+
+// StartPeer records peer identity explicitly, independent of runtime names.
+func StartPeer(ctx context.Context, dir, name, peer string, status func() any, stop func()) (func(), error) {
 	dir = filepath.Join(dir, "run")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
@@ -65,6 +71,8 @@ func Start(ctx context.Context, dir, name string, status func() any, stop func()
 			err = d.Decode(&req)
 			if err == nil {
 				switch req.Command {
+				case "info":
+					json.NewEncoder(c).Encode(struct{ Peer string }{peer})
 				case "status":
 					json.NewEncoder(c).Encode(status())
 				case "stop":
@@ -93,26 +101,34 @@ func Query(dir, name, command string) (map[string]json.RawMessage, error) {
 		return nil, err
 	}
 	out := map[string]json.RawMessage{}
+	// An exact runtime name takes precedence over any peer with the same name.
+	runtimeTarget := false
+	for _, e := range entries {
+		if name != "" && e.Name() == name+".sock" && e.Type()&os.ModeSocket != 0 {
+			runtimeTarget = true
+		}
+	}
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".sock") || e.Type()&os.ModeSocket == 0 {
 			continue
 		}
 		n := strings.TrimSuffix(e.Name(), ".sock")
-		if name != "" && n != name && !strings.HasSuffix(n, "-"+name) {
-			continue
+		path := filepath.Join(dir, "run", e.Name())
+		if name != "" && n != name {
+			if runtimeTarget {
+				continue
+			}
+			b, err := request(path, "info")
+			var info struct{ Peer string }
+			if err != nil || json.Unmarshal(b, &info) != nil || info.Peer != name {
+				continue
+			}
 		}
-		c, err := net.DialTimeout("unix", filepath.Join(dir, "run", e.Name()), time.Second)
+		b, err := request(path, command)
 		if err != nil {
-			continue
-		}
-		c.SetDeadline(time.Now().Add(2 * time.Second))
-		err = json.NewEncoder(c).Encode(map[string]string{"Command": command})
-		var b []byte
-		if err == nil {
-			b, err = io.ReadAll(io.LimitReader(c, 1<<20))
-		}
-		c.Close()
-		if err != nil {
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ECONNREFUSED) {
+				continue
+			}
 			return nil, fmt.Errorf("%s: %w", n, err)
 		}
 		if !json.Valid(b) {
@@ -121,4 +137,17 @@ func Query(dir, name, command string) (map[string]json.RawMessage, error) {
 		out[n] = json.RawMessage(b)
 	}
 	return out, nil
+}
+
+func request(path, command string) ([]byte, error) {
+	c, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(2 * time.Second))
+	if err := json.NewEncoder(c).Encode(map[string]string{"Command": command}); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(io.LimitReader(c, 1<<20))
 }

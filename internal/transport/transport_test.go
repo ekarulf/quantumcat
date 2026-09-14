@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/http/httptest"
@@ -33,6 +34,61 @@ func TestMain(m *testing.M) {
 		return syncs.ClosedChan(), func() {}
 	})
 	os.Exit(m.Run())
+}
+
+func TestInstallationFailureNeverAcknowledged(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	relay := derpserver.New(key.NewNode(), t.Logf)
+	httpRelay := httptest.NewTLSServer(derpserver.Handler(relay))
+	t.Cleanup(func() { relay.Close(); httpRelay.Close() })
+	stun, closeSTUN := stuntest.ServeWithPacketListener(t, nettype.Std{})
+	defer closeSTUN()
+	si, _ := software.Generate()
+	ci, _ := software.Generate()
+	sp, _ := si.PublicKey(ctx)
+	cp, _ := ci.PublicKey(ctx)
+	server := Server(si, sp, key.NewNode(), func(id protocol.PeerID) []byte {
+		if id == protocol.ID(cp) {
+			return cp
+		}
+		return nil
+	})
+	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{
+		Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none",
+		DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: stun.Port, STUNTestIP: "127.0.0.1", InsecureForTests: true,
+	}}}
+	var installs, finishes atomic.Int32
+	server.OnTunnelPeer = func(key.NodePublic, bool) error {
+		installs.Add(1)
+		return errors.New("simulated route installation failure")
+	}
+	original := server.Bootstrap
+	server.Bootstrap = func(src key.NodePublic, packet []byte) ([]byte, *tailcat.AuthenticatedPeer) {
+		kind, _, _ := protocol.Parse(packet)
+		if kind == protocol.ClientFinish {
+			finishes.Add(1)
+		}
+		return original(src, packet)
+	}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := Client(ci, software.NewKEM, sp, server.TailcatAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err = client.Ping(ctx); err == nil {
+		t.Fatal("acknowledged failed installation")
+	}
+	if installs.Load() != 1 || finishes.Load() < 2 {
+		t.Fatalf("failure/retry path not exercised: installs=%d finishes=%d", installs.Load(), finishes.Load())
+	}
+	if len(server.Status().Peer) != 0 {
+		t.Fatal("failed installation retained peer state")
+	}
 }
 func TestTunnelAuthenticationLossAndRevocation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)

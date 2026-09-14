@@ -13,12 +13,21 @@ import (
 	"tailscale.com/types/key"
 )
 
+const (
+	SessionLifetime = time.Hour
+	RenewInterval   = 45 * time.Minute
+)
+
 func Keys(node key.NodePrivate) protocol.Keys {
 	wg := node.Public().Raw32()
 	disco := tailcat.DiscoPublicForNode(node).Raw32()
 	return protocol.Keys{WG: wg, Disco: disco}
 }
 func Server(identity provider.Identity, pub []byte, node key.NodePrivate, lookup func(protocol.PeerID) []byte) *tailcat.Server {
+	return serverWithLifetime(identity, pub, node, lookup, SessionLifetime)
+}
+
+func serverWithLifetime(identity provider.Identity, pub []byte, node key.NodePrivate, lookup func(protocol.PeerID) []byte, lifetime time.Duration) *tailcat.Server {
 	p := &protocol.Server{Identity: identity, Public: pub, Keys: Keys(node), Lookup: lookup}
 	return &tailcat.Server{
 		BootstrapCleanup: func() { p.Expire(time.Now()) },
@@ -31,10 +40,10 @@ func Server(identity provider.Identity, pub []byte, node key.NodePrivate, lookup
 			if session == nil {
 				return reply, nil
 			}
-			peer := &tailcat.AuthenticatedPeer{Disco: key.DiscoPublicFromRaw32(mem.B(session.Keys.Disco[:])), PSK: tailcat.PresharedKey(session.PSK)}
+			peer := &tailcat.AuthenticatedPeer{Identity: [32]byte(session.Peer), Disco: key.DiscoPublicFromRaw32(mem.B(session.Keys.Disco[:])), PSK: tailcat.PresharedKey(session.PSK), Installed: session.Installed}
 			id := session.Peer
 			pinned := append([]byte(nil), lookup(id)...)
-			expires := time.Now().Add(time.Hour)
+			expires := time.Now().Add(lifetime)
 			peer.Valid = func() bool { return time.Now().Before(expires) && len(pinned) > 0 && bytes.Equal(lookup(id), pinned) }
 			clear(session.PSK[:])
 			return reply, peer

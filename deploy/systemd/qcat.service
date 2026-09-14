@@ -1,0 +1,17 @@
+[Unit]
+Description=Quantumcat SSH and Mosh server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/qcat --config %h/.config/qcat serve --tcp 22=127.0.0.1:22 --udp 60000:61000=127.0.0.1:60000
+Restart=always
+RestartSec=5
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

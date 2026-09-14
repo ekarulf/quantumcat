@@ -61,12 +61,61 @@ func TestHandshakeAndRetransmission(t *testing.T) {
 	if session == nil || session.PSK != psk || psk == [32]byte{} || !c.Accepted(ack) {
 		t.Fatal("key confirmation mismatch")
 	}
+	session.Installed(true)
 	ack2, session := s.Handle(ctx, src, finish, now.Add(3*time.Second))
 	if session != nil || !bytes.Equal(ack, ack2) {
 		t.Fatal("finish replay must not reinstall session")
 	}
 	if _, err = c.kem.Decapsulate(ctx, make([]byte, 1568)); err == nil {
 		t.Fatal("ephemeral key survived completion")
+	}
+}
+
+func TestFailedInstallationCannotBeAcknowledgedOnRetry(t *testing.T) {
+	s, c, hello, src, now := fixture(t)
+	ctx := context.Background()
+	reply, _ := s.Handle(ctx, src, hello, now)
+	_, finish, err := c.Complete(ctx, reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, session := s.Handle(ctx, src, finish, now)
+	if session == nil {
+		t.Fatal("missing installation candidate")
+	}
+	if ack, next := s.Handle(ctx, src, finish, now); ack != nil || next != nil {
+		t.Fatal("acknowledged installation before it completed")
+	}
+	session.Installed(false)
+	session.Installed(true) // A failure cannot later be committed.
+	if ack, next := s.Handle(ctx, src, finish, now); ack != nil || next != nil {
+		t.Fatal("acknowledged rejected installation")
+	}
+	if len(s.pending) != 0 {
+		t.Fatal("retained rejected session secrets")
+	}
+}
+
+func TestInvalidSignaturesDoNotChargeIdentityQuota(t *testing.T) {
+	s, _, hello, src, now := fixture(t)
+	ctx := context.Background()
+	forged := append([]byte(nil), hello...)
+	attacker := src
+	attacker[0] ^= 1
+	copy(forged[40:72], attacker[:]) // Source/WG match, but signature is invalid.
+	for range 100 {
+		if reply, session := s.Handle(ctx, attacker, forged, now); reply != nil || session != nil {
+			t.Fatal("accepted invalid signature")
+		}
+	}
+	if len(s.peerLimits) != 0 {
+		t.Fatal("charged unauthenticated claimed identity")
+	}
+	if s.global.count != 4 {
+		t.Fatalf("source bypassed verification quota: %d", s.global.count)
+	}
+	if reply, _ := s.Handle(ctx, src, hello, now); len(reply) == 0 {
+		t.Fatal("invalid sender prevented legitimate authentication")
 	}
 }
 func TestRejectClientTampering(t *testing.T) {

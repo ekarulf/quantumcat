@@ -21,21 +21,36 @@ type Helper struct {
 	in     io.WriteCloser
 	out    io.ReadCloser
 	closed bool
+	done   chan struct{}
 }
 
 func Open() (*Helper, error) {
-	path := os.Getenv("QCAT_SE_HELPER")
+	path, err := helperPath()
+	if err != nil {
+		return nil, err
+	}
+	return start(exec.Command(path))
+}
+
+func helperPath() (string, error) {
+	path := os.Getenv("QCAT_ENCLAVE_HELPER")
+	if path == "" {
+		path = os.Getenv("QCAT_SE_HELPER") // Compatibility with existing LaunchAgents.
+	}
 	if path == "" {
 		exe, err := os.Executable()
 		if err != nil {
-			return nil, err
+			return "", err
 		}
 		path = filepath.Join(filepath.Dir(exe), "qcat-se")
 	}
 	if !filepath.IsAbs(path) {
-		return nil, errors.New("QCAT_SE_HELPER must be an absolute path")
+		return "", errors.New("QCAT_ENCLAVE_HELPER must be an absolute path")
 	}
-	cmd := exec.Command(path)
+	return path, nil
+}
+
+func start(cmd *exec.Cmd) (*Helper, error) {
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -50,8 +65,17 @@ func Open() (*Helper, error) {
 		out.Close()
 		return nil, fmt.Errorf("start Secure Enclave helper (run make helper): %w", err)
 	}
-	return &Helper{cmd: cmd, in: in, out: out}, nil
+	h := &Helper{cmd: cmd, in: in, out: out, done: make(chan struct{})}
+	go func() {
+		cmd.Wait()
+		close(h.done)
+	}()
+	return h, nil
 }
+
+// Done closes when the helper exits, including cancellation or unexpected death.
+// A daemon must not continue accepting work with this dead identity provider.
+func (h *Helper) Done() <-chan struct{} { return h.done }
 func (h *Helper) call(ctx context.Context, op byte, payload []byte) ([]byte, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -98,7 +122,7 @@ func (h *Helper) Close() {
 		h.in.Close()
 		h.cmd.Process.Kill()
 		h.out.Close()
-		h.cmd.Wait()
+		<-h.done
 	}
 }
 func (h *Helper) GenerateIdentity(ctx context.Context) ([]byte, error) { return h.call(ctx, 1, nil) }

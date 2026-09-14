@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.quantumcat.server</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>REPLACE_HOME/.local/bin/qcat</string>
+        <string>--config</string><string>REPLACE_HOME/.config/qcat</string>
+        <string>serve</string>
+        <string>--tcp</string><string>22=127.0.0.1:22</string>
+        <string>--udp</string><string>60000:61000=127.0.0.1:60000</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>30</integer>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>Umask</key><integer>63</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key><string>REPLACE_HOME</string>
+        <key>QCAT_ENCLAVE_HELPER</key><string>REPLACE_HOME/.local/bin/qcat-se</string>
+    </dict>
+    <key>StandardOutPath</key><string>REPLACE_HOME/Library/Logs/qcat-server.log</string>
+    <key>StandardErrorPath</key><string>REPLACE_HOME/Library/Logs/qcat-server.log</string>
+</dict>
+</plist>

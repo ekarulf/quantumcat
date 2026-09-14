@@ -1,0 +1,102 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: '**/go.sum'
+      - run: go mod verify
+      - run: go vet -mod=readonly ./...
+      - run: go test -mod=readonly -race -timeout 10m ./...
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            target: darwin-arm64
+          - os: ubuntu-24.04
+            target: linux-amd64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: ubuntu-24.04
+            target: freebsd-amd64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: '**/go.sum'
+      - name: Build and package
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash scripts/package-release.sh "$TARGET"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: qcat-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    # Dispatches and ordinary pushes produce artifacts, never releases.
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: qcat-*
+          path: dist
+          merge-multiple: true
+      - name: Verify and create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd dist
+          shopt -s nullglob
+          archives=(qcat-*.tar.gz)
+          sums=(qcat-*.tar.gz.sha256)
+          test "${#archives[@]}" -eq 4
+          test "${#sums[@]}" -eq 4
+          cat "${sums[@]}" > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" --draft --generate-notes \
+            "${archives[@]}" "${sums[@]}" SHA256SUMS
