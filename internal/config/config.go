@@ -84,6 +84,9 @@ func DefaultDir() string {
 	return filepath.Join(home, ".config", "qcat")
 }
 func Read(path string, out any, secret bool) error {
+	return read(path, out, secret, false)
+}
+func read(path string, out any, secret, authorization bool) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -98,6 +101,24 @@ func Read(path string, out any, secret bool) error {
 	}
 	if secret && st.Mode().Perm()&0077 != 0 {
 		return errors.New("identity file must have mode 0600")
+	}
+	if secret || authorization {
+		if err := trustedOwner(st); err != nil {
+			return err
+		}
+		if st.Mode().Perm()&0022 != 0 {
+			return fmt.Errorf("%s: authorization file is group/other writable", path)
+		}
+		if err := trustedPath(path, false); err != nil {
+			return err
+		}
+		current, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(st, current) {
+			return fmt.Errorf("%s: file changed while opening", path)
+		}
 	}
 	d := json.NewDecoder(io.LimitReader(f, MaxFile+1))
 	d.DisallowUnknownFields()
@@ -139,6 +160,12 @@ func (s Store) Init(ctx context.Context, name, kind string) error {
 	if err := CheckName(name); err != nil {
 		return err
 	}
+	if err := os.MkdirAll(s.Dir, 0700); err != nil {
+		return err
+	}
+	if err := s.checkStore(); err != nil {
+		return err
+	}
 	if kind == "" {
 		kind = "software"
 		if runtime.GOOS == "darwin" {
@@ -171,6 +198,9 @@ func (s Store) Init(ctx context.Context, name, kind string) error {
 }
 func (s Store) Identity(ctx context.Context) (provider.Identity, provider.NewKEM, IdentityFile, func(), error) {
 	var f IdentityFile
+	if err := s.checkStore(); err != nil {
+		return nil, nil, f, func() {}, err
+	}
 	if err := Read(filepath.Join(s.Dir, "identity.json"), &f, true); err != nil {
 		return nil, nil, f, func() {}, err
 	}
@@ -186,12 +216,8 @@ func (s Store) Identity(ctx context.Context) (provider.Identity, provider.NewKEM
 		}
 		return i, software.NewKEM, f, i.Destroy, nil
 	case "secure-enclave":
-		h, err := se.Open()
+		h, err := se.OpenIdentity(ctx, f.Private)
 		if err != nil {
-			return nil, nil, f, func() {}, err
-		}
-		if err = h.LoadIdentity(ctx, f.Private); err != nil {
-			h.Close()
 			return nil, nil, f, func() {}, err
 		}
 		return h, se.NewKEM, f, h.Close, nil
@@ -204,13 +230,25 @@ func (s Store) Peer(name string) (Peer, error) {
 	if err := CheckName(name); err != nil {
 		return p, err
 	}
-	err := Read(filepath.Join(s.Dir, "peers", name+".qpeer"), &p, false)
+	if err := s.checkPeers(); err != nil {
+		return p, err
+	}
+	if err := trustedPath(filepath.Join(s.Dir, "peers", name+".qpeer"), false); err != nil {
+		return p, err
+	}
+	err := read(filepath.Join(s.Dir, "peers", name+".qpeer"), &p, false, true)
 	if err != nil {
 		return p, err
 	}
 	return p, p.Validate()
 }
 func (s Store) Peers() ([]Peer, error) {
+	if err := s.checkPeers(); err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
 	entries, err := os.ReadDir(filepath.Join(s.Dir, "peers"))
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -224,8 +262,11 @@ func (s Store) Peers() ([]Peer, error) {
 			continue
 		}
 		var p Peer
-		if err = Read(filepath.Join(s.Dir, "peers", e.Name()), &p, false); err != nil {
+		if err = trustedPath(filepath.Join(s.Dir, "peers", e.Name()), false); err != nil {
 			return nil, err
+		}
+		if err = read(filepath.Join(s.Dir, "peers", e.Name()), &p, false, true); err != nil {
+			return nil, fmt.Errorf("%s: %w", e.Name(), err)
 		}
 		if err = p.Validate(); err != nil {
 			return nil, fmt.Errorf("%s: %w", e.Name(), err)
@@ -236,6 +277,12 @@ func (s Store) Peers() ([]Peer, error) {
 }
 func (s Store) Add(name, path string) error {
 	if err := CheckName(name); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(s.Dir, 0700); err != nil {
+		return err
+	}
+	if err := s.checkStore(); err != nil {
 		return err
 	}
 	var p Peer

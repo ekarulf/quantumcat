@@ -333,6 +333,15 @@ file to `.qpeer.revoked` for recovery. Running servers reload pairing and remove
 the device's active WireGuard sessions within approximately two seconds.
 Malformed peer configuration fails closed.
 
+Configuration and peer directories must be owned by root or the running user
+and not writable by group/others; the same integrity checks apply to peer files.
+Group-readable root-managed files (0750 directories, 0640 peers) are supported.
+Identity files additionally forbid all group/other permissions. Symlinked
+identity/peer files and symlinked config/peer directories are rejected.
+Reload errors revoke all authorizations and report the offending file to stderr;
+identical errors are logged only once, and recovery is reported. Correct the
+file and the daemon reloads it automatically; stale authorizations are not kept.
+
 ## SOCKS and streams
 
 ```sh
@@ -508,8 +517,10 @@ sleep even when the OS pauses its monotonic clock. Recovery retains local
 listeners, the client identity, and the TCP stack; an SSH connection whose remote
 TCP state has already timed out cannot be resurrected. UDP can resume after the
 server lease expires without restarting the forwarder.
-A server exits if its persistent Secure Enclave helper dies,
-including on a signing timeout, allowing its supervisor to reload the identity.
+If an identity helper dies or a signing operation times out, the next signing
+attempt starts a fresh helper, reloads the same opaque Enclave reference, and
+checks its public key against the original. Existing tunnels remain intact.
+Ephemeral KEM helpers are never reopened; failed handshakes generate fresh keys.
 A Mac mini LaunchAgent template is provided
 in `deploy/com.ekarulf.qcat-server.plist`; adapt its absolute paths before use.
 

@@ -102,6 +102,24 @@ func TestUDPFramesLossExpiryAndLimits(t *testing.T) {
 		}
 	}
 }
+
+func TestSparseFragmentsAllocateOnlyReceivedPayload(t *testing.T) {
+	capture := new(frameCapture)
+	if _, err := FramedUDP(capture).Write(make([]byte, MaxUDPDatagram)); err != nil {
+		t.Fatal(err)
+	}
+	decoder := new(udpDecoder)
+	decoder.accept(capture.frames[0], time.Now())
+	retained := 0
+	for _, assembly := range decoder.pending {
+		for _, chunk := range assembly.chunks {
+			retained += cap(chunk)
+		}
+	}
+	if retained > 2*udpChunkSize {
+		t.Fatalf("one fragment reserved %d bytes", retained)
+	}
+}
 func FuzzUDPFrame(f *testing.F) {
 	f.Add([]byte("QUD1"))
 	c := new(frameCapture)

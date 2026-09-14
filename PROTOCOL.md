@@ -59,7 +59,11 @@ Failures are silent to unauthenticated senders.
 Limits: a 64-packet serialized server queue, four hellos/second per source before
 the shared 64-verifications/second budget, and four new handshakes/second per
 PeerID only after signature verification. Invalid signatures cannot consume
-the claimed identity's quota. There are 256 pending handshakes, 4096 replay
+the claimed identity's quota. Token buckets refill continuously, with initial
+burst capacities of 4/64/4 respectively (not strict rolling-window maxima).
+Idle rate-table entries can be discarded after one second, when their buckets
+would be full again. There are 256 pending handshakes (at most eight per
+authenticated identity, shared across its source keys), 19,264 replay
 entries, 4096 entries in each separate source/identity rate table, and 4096
 installed sessions. The global budget is a resource bound, not a guarantee
 against distributed denial of service. Unknown peers trigger no signature work,
@@ -70,6 +74,10 @@ using the same WireGuard node/discovery keys. The server permits replacement of
 an active node's PSK and lease only for the same authenticated PQ identity and
 discovery key. Duplicate finishes only resend their acknowledgement; they never
 extend a lease or reinstall an older PSK. Revoked identities cannot renew.
+Selecting a finish for installation invalidates competing pending transcripts
+for the same source (and erases their key material). A second installation for
+that source cannot begin while the first is outstanding. Only the surviving
+committed transcript may resend its cached acknowledgement.
 
 The server updates the peer's PSK in place before acknowledging; the client
 updates its PSK after the authenticated acknowledgement and schedules a fresh
@@ -134,7 +142,8 @@ WireGuard pads to 16-byte boundaries; the 1120-byte budget is already aligned.
 Normal outer IPv4 packets are smaller. This budget covers the forwarded UDP
 data path, not TCP services, network-layer extensions, or DERP/TLS stream packets.
 
-Reassembly is per socket, handles out-of-order fragments, and ignores duplicate
+Reassembly stores only received fragment payloads; the full output buffer is
+allocated only on completion. Reassembly is per socket, handles out-of-order fragments, and ignores duplicate
 fragments of incomplete datagrams. At most eight incomplete datagrams are
 retained per flow. Entries have a fixed two-second deadline checked on incoming
 frames; the oldest entry is evicted when capacity is reached. Idle-flow shutdown

@@ -13,8 +13,10 @@ import (
 	"github.com/ekarulf/quantumcat/internal/protocol"
 	"github.com/ekarulf/quantumcat/internal/proxy"
 	"tailscale.com/derp/derpserver"
+	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/nettype"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -28,6 +30,8 @@ func TestPublishedUDPForwarding(t *testing.T) {
 	httpRelay := httptest.NewTLSServer(derpserver.Handler(relay))
 	defer httpRelay.Close()
 	defer relay.Close()
+	stun, closeSTUN := stuntest.ServeWithPacketListener(t, nettype.Std{})
+	defer closeSTUN()
 	echo, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)
@@ -66,7 +70,7 @@ func TestPublishedUDPForwarding(t *testing.T) {
 		}
 		return nil
 	})
-	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none", DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: -1, InsecureForTests: true}}}
+	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none", DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: stun.Port, STUNTestIP: "127.0.0.1", InsecureForTests: true}}}
 	server.Logf = t.Logf
 	server.OnUDP, err = proxy.UDPServices(ctx, map[uint16]string{60001: echo.LocalAddr().String()})
 	if err != nil {

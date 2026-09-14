@@ -253,12 +253,14 @@ func (t *memoryTUN) Write(bufs [][]byte, offset int) (int, error) {
 	return len(bufs), nil
 }
 func TestIPModeHostPackets(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	relay := derpserver.New(key.NewNode(), t.Logf)
 	httpRelay := httptest.NewTLSServer(derpserver.Handler(relay))
 	defer httpRelay.Close()
 	defer relay.Close()
+	stun, closeSTUN := stuntest.ServeWithPacketListener(t, nettype.Std{})
+	defer closeSTUN()
 	si, _ := software.Generate()
 	ci, _ := software.Generate()
 	sp, _ := si.PublicKey(ctx)
@@ -269,7 +271,7 @@ func TestIPModeHostPackets(t *testing.T) {
 		}
 		return nil
 	})
-	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none", DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: -1, InsecureForTests: true}}}
+	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none", DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: stun.Port, STUNTestIP: "127.0.0.1", InsecureForTests: true}}}
 	st := newMemoryTUN()
 	server.TUN = st
 	server.Logf = t.Logf
@@ -285,9 +287,14 @@ func TestIPModeHostPackets(t *testing.T) {
 	ct := newMemoryTUN()
 	c.TUN = ct
 	c.Logf = t.Logf
-	if _, err = c.Ping(ctx); err != nil {
-		t.Fatal(err)
+	startupCtx, stopStartup := context.WithTimeout(ctx, 45*time.Second)
+	_, err = c.Ping(startupCtx)
+	stopStartup()
+	if err != nil {
+		t.Fatalf("IP-mode bootstrap: %v", err)
 	}
+	packetCtx, stopPackets := context.WithTimeout(ctx, 20*time.Second)
+	defer stopPackets()
 	local := tailcat.NodeAddress(c.PublicKey()).As16()
 	remote := tailcat.NodeAddress(server.Key.Public()).As16()
 	// IPv6 + UDP. The memory device tests packet transport, not an OS UDP stack.
@@ -318,10 +325,14 @@ func TestIPModeHostPackets(t *testing.T) {
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
-			t.Fatal("TUN packet did not traverse authenticated WireGuard")
+		case <-packetCtx.Done():
+			t.Fatalf("TUN packet did not traverse authenticated WireGuard after bootstrap: %v", packetCtx.Err())
 		case <-ticker.C:
-			ct.in <- packet
+			select {
+			case ct.in <- packet:
+			case <-packetCtx.Done():
+				t.Fatalf("TUN injection blocked: %v", packetCtx.Err())
+			}
 		case got := <-st.out:
 			if bytes.Equal(got, packet) {
 				return

@@ -307,6 +307,7 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 			server.ServedUDPPorts = append(server.ServedUDPPorts, filter.PortRange{First: port, Last: port})
 		}
 	}
+	server.ServedTCPPorts = publishedTCPPorts(targets)
 	server.OnTCP = func(port uint16) func(net.Conn) {
 		if port == 1 {
 			return func(c net.Conn) { proxy.Serve(c, func(target string) bool { return allowed[target] }) }
@@ -353,6 +354,7 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 	// Reload pairing on every tick. A malformed file fails closed.
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	var reloadError string
 	for {
 		select {
 		case <-identityDone:
@@ -360,13 +362,7 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			list, err := s.Peers()
-			next := map[protocol.PeerID][]byte{}
-			if err == nil {
-				for _, p := range list {
-					next[protocol.ID(p.PublicKey)] = p.PublicKey
-				}
-			}
+			next := reloadAuthorizations(s, os.Stderr, &reloadError)
 			mu.Lock()
 			authorized = next
 			mu.Unlock()

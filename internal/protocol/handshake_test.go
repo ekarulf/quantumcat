@@ -111,8 +111,8 @@ func TestInvalidSignaturesDoNotChargeIdentityQuota(t *testing.T) {
 	if len(s.peerLimits) != 0 {
 		t.Fatal("charged unauthenticated claimed identity")
 	}
-	if s.global.count != 4 {
-		t.Fatalf("source bypassed verification quota: %d", s.global.count)
+	if s.global.tokens != 60 {
+		t.Fatalf("source bypassed verification quota: %v remaining", s.global.tokens)
 	}
 	if reply, _ := s.Handle(ctx, src, hello, now); len(reply) == 0 {
 		t.Fatal("invalid sender prevented legitimate authentication")

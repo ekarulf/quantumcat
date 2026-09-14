@@ -26,7 +26,8 @@ const (
 )
 
 type udpAssembly struct {
-	data      []byte
+	chunks    [64][]byte
+	size      int
 	seen      uint64 // at most 63 fragments for an IPv4 UDP payload
 	remaining int
 	expires   time.Time
@@ -80,24 +81,28 @@ func (d *udpDecoder) accept(frame []byte, now time.Time) ([]byte, bool) {
 			}
 			delete(d.pending, oldest)
 		}
-		p = &udpAssembly{data: make([]byte, size), remaining: count, expires: now.Add(udpAssemblyLifetime)}
+		p = &udpAssembly{size: size, remaining: count, expires: now.Add(udpAssemblyLifetime)}
 		d.pending[id] = p
 	}
-	if len(p.data) != size {
+	if p.size != size {
 		return nil, false
 	}
 	bit := uint64(1) << index
 	if p.seen&bit != 0 {
 		return nil, false
 	}
-	copy(p.data[offset:], frame[udpFrameHeader:])
+	p.chunks[index] = append([]byte(nil), frame[udpFrameHeader:]...)
 	p.seen |= bit
 	p.remaining--
 	if p.remaining != 0 {
 		return nil, false
 	}
 	delete(d.pending, id)
-	return p.data, true
+	data := make([]byte, size)
+	for i, chunk := range p.chunks {
+		copy(data[min(i*udpChunkSize, size):], chunk)
+	}
+	return data, true
 }
 
 // FramedUDP preserves application datagrams over Tailcat's IPv6 MTU. It adds

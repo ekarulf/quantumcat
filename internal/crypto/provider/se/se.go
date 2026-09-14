@@ -85,8 +85,13 @@ func (h *Helper) call(ctx context.Context, op byte, payload []byte) ([]byte, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	stop := context.AfterFunc(ctx, func() { h.cmd.Process.Kill() })
-	defer stop()
+	killed := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() { h.cmd.Process.Kill(); close(killed) })
+	defer func() {
+		if !stop() {
+			<-killed
+		}
+	}()
 	if len(payload) > 32767 {
 		return nil, errors.New("helper request too large")
 	}

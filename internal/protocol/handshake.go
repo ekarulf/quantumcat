@@ -19,10 +19,19 @@ import (
 var ErrRejected = errors.New("handshake rejected")
 
 func derive(ss []byte, hash [32]byte) (psk, confirmation [32]byte) {
-	prk, _ := hkdf.Extract(sha256.New, ss, hash[:])
+	prk, err := hkdf.Extract(sha256.New, ss, hash[:])
+	if err != nil {
+		panic("HKDF extract failed: " + err.Error())
+	}
 	defer clear(prk)
-	p, _ := hkdf.Expand(sha256.New, prk, "qcat-wireguard-psk-v1", 32)
-	c, _ := hkdf.Expand(sha256.New, prk, "qcat-handshake-confirm-v1", 32)
+	p, err := hkdf.Expand(sha256.New, prk, "qcat-wireguard-psk-v1", 32)
+	if err != nil {
+		panic("HKDF PSK expansion failed: " + err.Error())
+	}
+	c, err := hkdf.Expand(sha256.New, prk, "qcat-handshake-confirm-v1", 32)
+	if err != nil {
+		panic("HKDF confirmation expansion failed: " + err.Error())
+	}
 	copy(psk[:], p)
 	copy(confirmation[:], c)
 	clear(p)
@@ -134,8 +143,8 @@ type pending struct {
 	response   []byte
 }
 type bucket struct {
-	start time.Time
-	count int
+	start  time.Time
+	tokens float64
 }
 type Server struct {
 	mu       sync.Mutex
@@ -182,11 +191,17 @@ func (s *Server) Close() {
 }
 
 func allow(b bucket, now time.Time, max int) (bucket, bool) {
-	if now.Sub(b.start) >= time.Second || b.start.IsZero() {
-		b = bucket{start: now}
+	if b.start.IsZero() {
+		b = bucket{start: now, tokens: float64(max)}
+	} else if now.After(b.start) {
+		b.tokens = min(float64(max), b.tokens+now.Sub(b.start).Seconds()*float64(max))
+		b.start = now
 	}
-	b.count++
-	return b, b.count <= max
+	if b.tokens < 1 {
+		return b, false
+	}
+	b.tokens--
+	return b, true
 }
 
 // Handle is serialized and bounds all caches. No work or state is allocated for
@@ -212,7 +227,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	}
 	for _, limits := range []map[[32]byte]bucket{s.limits, s.peerLimits} {
 		for h, t := range limits {
-			if now.Sub(t.start) > time.Minute {
+			if now.Sub(t.start) > time.Second {
 				delete(limits, h)
 			}
 		}
@@ -229,6 +244,21 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		}
 		if p.installing {
 			return nil, nil
+		}
+		// Only one installation may be outstanding per transport source.
+		// Discard competing transcripts before handing a PSK to the transport;
+		// otherwise a delayed finish could roll back a completed renewal.
+		for _, other := range s.pending {
+			if other != p && other.source == source && other.installing && !other.accepted {
+				return nil, nil
+			}
+		}
+		for key, other := range s.pending {
+			if other != p && other.source == source {
+				clear(other.hk[:])
+				clear(other.session.PSK[:])
+				delete(s.pending, key)
+			}
 		}
 		session := p.session
 		p.installing = true
@@ -291,7 +321,9 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		}
 		return nil, nil
 	}
-	if len(s.replay) >= 4096 || len(s.pending) >= 256 {
+	// Replay retention covers the full global token budget over five minutes,
+	// including its initial burst. Pending work also has an identity quota.
+	if len(s.replay) >= 64*301 || len(s.pending) >= 256 {
 		return nil, nil
 	}
 	hello := b[:helloSize]
@@ -303,6 +335,15 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	}
 	s.peerLimits[[32]byte(id)], ok = allow(s.peerLimits[[32]byte(id)], now, 4)
 	if !ok {
+		return nil, nil
+	}
+	owned := 0
+	for _, p := range s.pending {
+		if p.session.Peer == id {
+			owned++
+		}
+	}
+	if owned >= 8 {
 		return nil, nil
 	}
 	kp, err := mlkem1024.Scheme().UnmarshalBinaryPublicKey(hello[200:])
