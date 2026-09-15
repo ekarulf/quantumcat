@@ -439,11 +439,15 @@ func client(ctx context.Context, s config.Store, command string, args []string) 
 	}
 	renewCtx, stopRenewal := context.WithCancel(ctx)
 	renewDone := make(chan struct{})
+	var reportRenewalError func(error)
+	if command != "connect" {
+		reportRenewalError = func(err error) {
+			fmt.Fprintln(os.Stderr, "qcat: tunnel recovery/renewal failed; retrying:", err)
+		}
+	}
 	go func() {
 		defer close(renewDone)
-		transport.Maintain(renewCtx, c, func(err error) {
-			fmt.Fprintln(os.Stderr, "qcat: tunnel recovery/renewal failed; retrying:", err)
-		})
+		transport.Maintain(renewCtx, c, reportRenewalError)
 	}()
 	defer func() { stopRenewal(); <-renewDone }()
 	if command != "connect" {
