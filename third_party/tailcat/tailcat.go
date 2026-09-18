@@ -337,6 +337,7 @@ type locoBackend struct {
 	tunnelPeer       func(key.NodePublic, bool) error
 	peerValid        map[key.NodePublic]func() bool
 	peerOwners       map[key.NodePublic][32]byte
+	peerInstalled    map[key.NodePublic]time.Time
 	nextClientID     int
 	bootstrapDone    chan struct{}
 	authenticated    bool
@@ -369,6 +370,24 @@ type locoBackend struct {
 	allowedClients map[key.NodePublic]bool // or nil map for all
 	eps            []netip.AddrPort        // our current local UDP endpoints, sorted
 	closeOnce      sync.Once
+}
+
+const maxSessionsPerIdentity = 16
+
+func oldestSessionForIdentity(owners map[key.NodePublic][32]byte, installed map[key.NodePublic]time.Time, identity [32]byte) (key.NodePublic, int) {
+	var oldest key.NodePublic
+	var oldestAt time.Time
+	count := 0
+	for node, owner := range owners {
+		if owner != identity {
+			continue
+		}
+		count++
+		if at := installed[node]; oldestAt.IsZero() || at.Before(oldestAt) {
+			oldest, oldestAt = node, at
+		}
+	}
+	return oldest, count
 }
 
 func (b *locoBackend) derpRegionID() tailcfg.DERPRegionID {
@@ -434,6 +453,9 @@ type Server struct {
 	// Bootstrap replaces legacy Meow authorization when non-nil.
 	// The callback runs on a bounded, serialized worker.
 	Bootstrap func(key.NodePublic, []byte) ([]byte, *AuthenticatedPeer)
+	// ValidBootstrapFrame cheaply rejects malformed packets before they enter
+	// the bounded bootstrap queue. Nil accepts any QCAT-prefixed packet.
+	ValidBootstrapFrame func([]byte) bool
 	// Key is the server's node identity.
 	// If zero, Start generates a new ephemeral key.
 	Key key.NodePrivate
@@ -650,6 +672,7 @@ func (s *Server) Start() error {
 		lb.peerPSKs = make(map[key.NodePublic]PresharedKey)
 		lb.peerValid = make(map[key.NodePublic]func() bool)
 		lb.peerOwners = make(map[key.NodePublic][32]byte)
+		lb.peerInstalled = make(map[key.NodePublic]time.Time)
 	}
 	type incoming struct {
 		region tailcfg.DERPRegionID
@@ -657,6 +680,8 @@ func (s *Server) Start() error {
 		packet []byte
 	}
 	inbox := make(chan incoming, 64)
+	var inboxMu sync.Mutex
+	queuedBySource := make(map[key.NodePublic]int)
 	if s.Bootstrap != nil {
 		lb.bootstrapDone = make(chan struct{})
 		lb.bootstrapStopped = make(chan struct{})
@@ -680,6 +705,7 @@ func (s *Server) Start() error {
 							delete(lb.peerPSKs, k)
 							delete(lb.peerValid, k)
 							delete(lb.peerOwners, k)
+							delete(lb.peerInstalled, k)
 							delete(lb.clients, k)
 							removed = append(removed, k)
 						}
@@ -703,6 +729,12 @@ func (s *Server) Start() error {
 					}
 					continue
 				case p = <-inbox:
+					inboxMu.Lock()
+					queuedBySource[p.src]--
+					if queuedBySource[p.src] == 0 {
+						delete(queuedBySource, p.src)
+					}
+					inboxMu.Unlock()
 				}
 				reply, peer := s.Bootstrap(p.src, p.packet)
 				if peer != nil {
@@ -728,6 +760,7 @@ func (s *Server) Start() error {
 						if ok {
 							lb.peerPSKs[p.src] = peer.PSK
 							lb.peerValid[p.src] = peer.Valid
+							lb.peerInstalled[p.src] = time.Now()
 						}
 						lb.mu.Unlock()
 						if !ok {
@@ -741,11 +774,23 @@ func (s *Server) Start() error {
 						}
 						continue
 					}
+					oldest, owned := oldestSessionForIdentity(lb.peerOwners, lb.peerInstalled, peer.Identity)
+					if owned >= maxSessionsPerIdentity {
+						lb.mu.Unlock()
+						lb.removeAuthenticatedPeer(oldest)
+						if lb.tunnelPeer != nil {
+							if err := lb.tunnelPeer(oldest, false); err != nil {
+								lb.logf("removing evicted tunnel peer: %v", err)
+							}
+						}
+						lb.mu.Lock()
+					}
 					full := len(lb.peerPSKs) >= 4096
 					if !exists && !full {
 						lb.peerPSKs[p.src] = peer.PSK
 						lb.peerValid[p.src] = peer.Valid
 						lb.peerOwners[p.src] = peer.Identity
+						lb.peerInstalled[p.src] = time.Now()
 					}
 					lb.mu.Unlock()
 					clear(peer.PSK[:])
@@ -776,11 +821,22 @@ func (s *Server) Start() error {
 	lb.onDERPRecv = func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool {
 		if s.Bootstrap != nil {
 			if len(pkt) >= 4 && string(pkt[:4]) == "QCAT" {
-				if len(pkt) <= 32768 {
+				if s.ValidBootstrapFrame == nil || s.ValidBootstrapFrame(pkt) {
+					inboxMu.Lock()
+					if queuedBySource[src] >= 4 {
+						inboxMu.Unlock()
+						return true
+					}
+					queuedBySource[src]++
 					select {
 					case inbox <- incoming{regionID, src, append([]byte(nil), pkt...)}:
 					default:
+						queuedBySource[src]--
+						if queuedBySource[src] == 0 {
+							delete(queuedBySource, src)
+						}
 					}
+					inboxMu.Unlock()
 				}
 				return true
 			}
@@ -1864,6 +1920,7 @@ func (b *locoBackend) removeAuthenticatedPeer(k key.NodePublic) {
 	delete(b.peerPSKs, k)
 	delete(b.peerValid, k)
 	delete(b.peerOwners, k)
+	delete(b.peerInstalled, k)
 	if b.nm != nil {
 		nm := *b.nm
 		nm.Peers = nil

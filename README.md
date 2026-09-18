@@ -271,13 +271,18 @@ go vet ./...
 
 ## Security model, in one paragraph
 
-QuantumCat trusts explicitly paired device identities, not relay infrastructure. ML-DSA authenticates the devices; fresh ML-KEM material is mixed into each WireGuard session as a PSK; WireGuard protects application traffic; DERP may relay packets but cannot authenticate as a peer or decrypt the session. Peer removal revokes authorization and active sessions are torn down shortly afterward. Private identity material stays local to each machine.
+QuantumCat trusts explicitly paired device identities, not relay infrastructure. ML-DSA authenticates the devices; fresh ML-KEM material is mixed into each WireGuard session as a PSK; WireGuard protects application traffic; DERP may relay packets but cannot authenticate as a peer or decrypt the session. Peer removal revokes authorization and active sessions are torn down shortly afterward. Private identity material stays local to each machine. On Linux and FreeBSD the software identity is stored in the config directory, so backing up that directory also backs up the private identity. A `qcat forward` or `qcat socks` listener grants tunnel access to every local process and should not be left running on a multi-user host.
 
 For the details and caveats, read [DESIGN.md](DESIGN.md) and [PROTOCOL.md](PROTOCOL.md).
 
 ## Project status
 
 QuantumCat is experimental. The implementation includes automated tests for authentication tampering, replay, identity/source binding, PSK freshness, forwarding policy, revocation, TCP/UDP transport, fragmentation, storage permissions, and local runtime control, but that is not a substitute for independent review.
+
+Current `main` intentionally breaks compatibility with v0.0.1: it uses Go's
+standard-library ML-DSA/ML-KEM implementations, SHA-384 bootstrap primitives,
+new PeerIDs, and identity-file version 2. Reinitialize identities and re-pair
+peers when upgrading from v0.0.1.
 
 Contributions, testing on real networks, protocol review, and security analysis are welcome.
 

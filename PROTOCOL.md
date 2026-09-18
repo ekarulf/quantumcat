@@ -1,5 +1,8 @@
 # Quantumcat bootstrap v1
 
+This pre-release definition intentionally replaces the original SHA-256-based
+version 1 and is not wire- or pairing-compatible with builds through v0.0.1.
+
 Network frames: ASCII `QCAT`, version byte `1`, message-type byte, big-endian
 uint16 payload length, payload. The header is eight bytes. Hard limit: 32768
 bytes. Every type has an exact size; reject unknown types, versions, and trailing
@@ -8,33 +11,33 @@ bytes. All integers use big-endian encoding.
 | Type | Payload, in order | Bytes |
 | --- | --- | --- |
 | 1 ClientHello | client PeerID (32), WG public (32), disco public (32), nonce (32), server PeerID (32), reserved zeros (32), Unix timestamp (8), KEM public (1568), signature (4627) | 6395 |
-| 2 ServerHello | server PeerID (32), WG public (32), disco public (32), nonce (32), ciphertext (1568), signature (4627), server proof (32) | 6355 |
-| 3 ClientFinish | transcript hash (32), client proof (32) | 64 |
-| 4 ServerAccepted | transcript hash (32), acknowledgement proof (32) | 64 |
+| 2 ServerHello | server PeerID (32), WG public (32), disco public (32), nonce (32), ciphertext (1568), signature (4627), server proof (48) | 6371 |
+| 3 ClientFinish | transcript hash (48), client proof (48) | 96 |
+| 4 ServerAccepted | transcript hash (48), acknowledgement proof (48) | 96 |
 
 ClientHello signs its unsigned frame, whose header payload length is **1768**
 (not the transmitted length 6395), with ML-DSA context
 `qcat-handshake-client-v1`. Reserved bytes must be zero.
 Public ML-DSA keys are 2592 bytes, obtained from the local pairing store.
-PeerID is SHA-256 of `qcat-peer-v1` followed by that key. Text IDs use
-`qpeer:` plus unpadded uppercase RFC 4648 base32. All 32 bytes are retained.
+PeerID is the first 32 bytes of SHA-384 over `qcat-peer-v1` followed by that
+key. Text IDs use `qpeer:` plus unpadded uppercase RFC 4648 base32. All 32
+identifier bytes are retained.
 
-Transcript hash is SHA-256 over this fixed concatenation:
+Transcript hash is SHA-384 over this fixed concatenation:
 
 ```text
-"qcat-transcript-v1" || version_byte ||
-server_peer_id || client_peer_id ||
-server_wg_public || client_wg_public ||
-server_disco_public || client_disco_public ||
-client_kem_public || kem_ciphertext ||
-client_nonce || server_nonce
+"qcat-transcript-v2" || version_byte ||
+server_peer_id || server_wg_public || server_disco_public ||
+server_nonce || kem_ciphertext || complete_unsigned_client_hello
 ```
 
-ServerHello signs the 32-byte hash with context `qcat-handshake-server-v1`.
-HKDF-SHA256 extracts the ML-KEM secret using the transcript hash as salt.
-Expand separate 32-byte keys with `qcat-wireguard-psk-v1` and
-`qcat-handshake-confirm-v1`. Proofs use HMAC-SHA256 under the confirmation
-key over a label followed by the transcript hash. Labels:
+The complete unsigned ClientHello includes its timestamp and reserved bytes.
+ServerHello signs the 48-byte hash with context `qcat-handshake-server-v1`.
+Because the ML-KEM shared secret is already pseudorandom, HKDF-Expand with
+SHA-384 derives separate 32-byte keys directly. Its info strings are
+`qcat-wireguard-psk-v2 || transcript_hash` and
+`qcat-handshake-confirm-v2 || transcript_hash`. Proofs use HMAC-SHA384 under
+the confirmation key over a label followed by the transcript hash. Labels:
 `server-finished`, `client-finished`, `server-accepted`.
 
 The DERP source must equal the signed client WG key. The client checks the

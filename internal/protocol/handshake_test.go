@@ -3,7 +3,9 @@ package protocol
 import (
 	"bytes"
 	"context"
+	"crypto/mlkem"
 	"crypto/rand"
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -203,6 +205,92 @@ func TestIndependentSessions(t *testing.T) {
 }
 func FuzzParse(f *testing.F) {
 	f.Add([]byte("QCAT"))
-	f.Add(frame(ClientFinish, make([]byte, 64)))
+	f.Add(frame(ClientFinish, make([]byte, hashSize+proofSize)))
 	f.Fuzz(func(t *testing.T, b []byte) { _, _, _ = Parse(b) })
+}
+
+func TestValidFrame(t *testing.T) {
+	valid := frame(ClientFinish, make([]byte, hashSize+proofSize))
+	if !ValidFrame(valid) {
+		t.Fatal("valid frame rejected")
+	}
+	for name, mutate := range map[string]func([]byte){
+		"version": func(b []byte) { b[4]++ },
+		"kind":    func(b []byte) { b[5] = 99 },
+		"length":  func(b []byte) { b[7]++ },
+	} {
+		t.Run(name, func(t *testing.T) {
+			packet := append([]byte(nil), valid...)
+			mutate(packet)
+			if ValidFrame(packet) {
+				t.Fatal("malformed frame accepted")
+			}
+		})
+	}
+	if ValidFrame(append(valid, 0)) {
+		t.Fatal("wrong-sized frame accepted")
+	}
+}
+
+func TestTranscriptCoversCompleteHello(t *testing.T) {
+	hello := make([]byte, helloSize)
+	server := PeerID{1}
+	keys := Keys{WG: [32]byte{2}, Disco: [32]byte{3}}
+	nonce := make([]byte, 32)
+	ct := make([]byte, mlkem.CiphertextSize1024)
+	want := transcript(hello, server, keys, nonce, ct)
+	for i := range hello {
+		hello[i] ^= 1
+		if got := transcript(hello, server, keys, nonce, ct); got == want {
+			t.Fatalf("hello byte %d is not transcript-bound", i)
+		}
+		hello[i] ^= 1
+	}
+}
+
+func TestDeriveKnownAnswer(t *testing.T) {
+	ss := make([]byte, 32)
+	var hash [hashSize]byte
+	for i := range ss {
+		ss[i] = byte(i)
+	}
+	for i := range hash {
+		hash[i] = byte(0x80 + i)
+	}
+	psk, confirmation, err := derive(ss, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := hex.EncodeToString(psk[:]), "4382598d92933ba95a56715c284157d77f3f9b99dff5a654c74455670421d02d"; got != want {
+		t.Fatalf("PSK = %s, want %s", got, want)
+	}
+	if got, want := hex.EncodeToString(confirmation[:]), "376e3da389d23edb393e42bde1abedebae3b87dd86439fb85ebbdb9c3c8abd02"; got != want {
+		t.Fatalf("confirmation = %s, want %s", got, want)
+	}
+}
+
+func TestExpirePrunesRateTables(t *testing.T) {
+	now := time.Now()
+	key := [32]byte{1}
+	s := &Server{
+		limits:     map[[32]byte]bucket{key: {start: now.Add(-2 * time.Second)}},
+		peerLimits: map[[32]byte]bucket{key: {start: now.Add(-2 * time.Second)}},
+	}
+	s.Expire(now)
+	if len(s.limits) != 0 || len(s.peerLimits) != 0 {
+		t.Fatal("expired rate entries retained")
+	}
+}
+
+func TestEvictOldest(t *testing.T) {
+	now := time.Now()
+	old, recent := [32]byte{1}, [32]byte{2}
+	table := map[[32]byte]bucket{
+		old:    {start: now.Add(-time.Second)},
+		recent: {start: now},
+	}
+	evictOldest(table)
+	if _, ok := table[old]; ok || len(table) != 1 {
+		t.Fatal("oldest rate entry was not evicted")
+	}
 }

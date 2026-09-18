@@ -3,17 +3,18 @@ package protocol
 import (
 	"context"
 	"encoding/binary"
-	"github.com/ekarulf/quantumcat/internal/crypto/provider/software"
 	"testing"
 	"time"
+
+	"github.com/ekarulf/quantumcat/internal/crypto/provider/software"
 )
 
 func TestReplayCapacityCoversGlobalBudget(t *testing.T) {
 	s, _, hello, source, now := fixture(t)
-	s.pending = make(map[[32]byte]*pending)
-	s.replay = make(map[[32]byte]time.Time)
+	s.pending = make(map[[hashSize]byte]*pending)
+	s.replay = make(map[[hashSize]byte]time.Time)
 	for n := 0; n < 4096; n++ {
-		var key [32]byte
+		var key [hashSize]byte
 		binary.BigEndian.PutUint64(key[:8], uint64(n))
 		s.replay[key] = now.Add(5 * time.Minute)
 	}

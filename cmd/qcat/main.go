@@ -351,10 +351,11 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 	if monitored, ok := i.(interface{ Done() <-chan struct{} }); ok {
 		identityDone = monitored.Done()
 	}
-	// Reload pairing on every tick. A malformed file fails closed.
+	// Reload pairing on every tick. Transient failures retain the last-known-good
+	// set; persistent failures still fail closed.
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	var reloadError string
+	var reloadState authorizationReload
 	for {
 		select {
 		case <-identityDone:
@@ -362,7 +363,7 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			next := reloadAuthorizations(s, os.Stderr, &reloadError)
+			next := reloadAuthorizations(s, os.Stderr, &reloadState, authorized)
 			mu.Lock()
 			authorized = next
 			mu.Unlock()

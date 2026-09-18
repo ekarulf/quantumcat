@@ -30,9 +30,10 @@ func Server(identity provider.Identity, pub []byte, node key.NodePrivate, lookup
 func serverWithLifetime(identity provider.Identity, pub []byte, node key.NodePrivate, lookup func(protocol.PeerID) []byte, lifetime time.Duration) *tailcat.Server {
 	p := &protocol.Server{Identity: identity, Public: pub, Keys: Keys(node), Lookup: lookup}
 	return &tailcat.Server{
-		BootstrapCleanup: func() { p.Expire(time.Now()) },
-		BootstrapClose:   p.Close,
-		Key:              node, DisablePresharedKey: true,
+		BootstrapCleanup:    func() { p.Expire(time.Now()) },
+		BootstrapClose:      p.Close,
+		ValidBootstrapFrame: protocol.ValidFrame,
+		Key:                 node, DisablePresharedKey: true,
 		Bootstrap: func(src key.NodePublic, b []byte) ([]byte, *tailcat.AuthenticatedPeer) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()

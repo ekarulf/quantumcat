@@ -10,18 +10,20 @@ import (
 )
 
 func TestHelperEnvironmentNames(t *testing.T) {
-	t.Setenv("QCAT_SE_HELPER", "/legacy/qcat-se")
-	t.Setenv("QCAT_ENCLAVE_HELPER", "/new/qcat-se")
-	if path, err := helperPath(); err != nil || path != "/new/qcat-se" {
-		t.Fatalf("new name: %q %v", path, err)
-	}
-	t.Setenv("QCAT_ENCLAVE_HELPER", "")
-	if path, err := helperPath(); err != nil || path != "/legacy/qcat-se" {
-		t.Fatalf("legacy: %q %v", path, err)
-	}
-	t.Setenv("QCAT_ENCLAVE_HELPER", "relative-path")
-	if _, err := helperPath(); err == nil {
-		t.Fatal("invalid canonical path fell back to legacy")
+	if os.Geteuid() != 0 {
+		t.Setenv("QCAT_SE_HELPER", "/legacy/qcat-se")
+		t.Setenv("QCAT_ENCLAVE_HELPER", "/new/qcat-se")
+		if path, err := helperPath(); err != nil || path != "/new/qcat-se" {
+			t.Fatalf("new name: %q %v", path, err)
+		}
+		t.Setenv("QCAT_ENCLAVE_HELPER", "")
+		if path, err := helperPath(); err != nil || path != "/legacy/qcat-se" {
+			t.Fatalf("legacy: %q %v", path, err)
+		}
+		t.Setenv("QCAT_ENCLAVE_HELPER", "relative-path")
+		if _, err := helperPath(); err == nil {
+			t.Fatal("invalid canonical path fell back to legacy")
+		}
 	}
 	t.Setenv("QCAT_ENCLAVE_HELPER", "")
 	t.Setenv("QCAT_SE_HELPER", "")
@@ -31,6 +33,45 @@ func TestHelperEnvironmentNames(t *testing.T) {
 	}
 	if path, err := helperPath(); err != nil || path != filepath.Join(filepath.Dir(exe), "qcat-se") {
 		t.Fatalf("default: %q %v", path, err)
+	}
+}
+
+func TestTrustedHelper(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "qcat-se")
+	if err := os.WriteFile(path, []byte("helper"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := trustedHelper(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0722); err != nil {
+		t.Fatal(err)
+	}
+	if err := trustedHelper(path); err == nil {
+		t.Fatal("writable helper trusted")
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := trustedHelper(path); err == nil {
+		t.Fatal("non-executable helper trusted")
+	}
+	if err := os.Chmod(path, 0700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "helper-link")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := trustedHelper(link); err == nil {
+		t.Fatal("symlink helper trusted")
+	}
+	if err := os.Chmod(dir, 0777); err != nil {
+		t.Fatal(err)
+	}
+	if err := trustedHelper(path); err == nil {
+		t.Fatal("helper beneath writable directory trusted")
 	}
 }
 
