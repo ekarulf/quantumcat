@@ -3,12 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
-	"github.com/ekarulf/quantumcat/internal/config"
-	"github.com/ekarulf/quantumcat/internal/protocol"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ekarulf/quantumcat/internal/config"
+	"github.com/ekarulf/quantumcat/internal/protocol"
 )
 
 func TestPublishedTCPFilter(t *testing.T) {
@@ -42,29 +43,33 @@ func TestReloadFailsClosedAndReportsRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	var log bytes.Buffer
-	previous := ""
-	if len(reloadAuthorizations(s, &log, &previous)) != 1 {
+	state := authorizationReload{}
+	current := reloadAuthorizations(s, &log, &state, nil)
+	if len(current) != 1 {
 		t.Fatal("valid peer missing")
 	}
 	bad := filepath.Join(s.Dir, "peers", "bad.qpeer")
 	if err := os.WriteFile(bad, []byte("{"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if len(reloadAuthorizations(s, &log, &previous)) != 0 {
-		t.Fatal("invalid config retained access")
+	if len(reloadAuthorizations(s, &log, &state, current)) != 1 {
+		t.Fatal("transient invalid config revoked access")
 	}
 	if !strings.Contains(log.String(), "bad.qpeer") {
 		t.Fatal("missing offending filename")
 	}
 	n := log.Len()
-	reloadAuthorizations(s, &log, &previous)
+	reloadAuthorizations(s, &log, &state, current)
 	if log.Len() != n {
 		t.Fatal("repeated error flooded logs")
+	}
+	if len(reloadAuthorizations(s, &log, &state, current)) != 0 {
+		t.Fatal("persistent invalid config retained access")
 	}
 	if err := os.Remove(bad); err != nil {
 		t.Fatal(err)
 	}
-	if len(reloadAuthorizations(s, &log, &previous)) != 1 || previous != "" {
+	if len(reloadAuthorizations(s, &log, &state, nil)) != 1 || state.failures != 0 {
 		t.Fatal("valid configuration did not recover")
 	}
 	if !strings.Contains(log.String(), "valid again") {

@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"context"
+	"crypto/mldsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +13,6 @@ import (
 	"regexp"
 	"runtime"
 
-	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
 	"github.com/ekarulf/quantumcat/internal/crypto/provider"
 	"github.com/ekarulf/quantumcat/internal/crypto/provider/se"
 	"github.com/ekarulf/quantumcat/internal/crypto/provider/software"
@@ -53,7 +53,7 @@ func (p Peer) Validate() error {
 	if err := CheckName(p.Name); err != nil {
 		return err
 	}
-	if len(p.PublicKey) != mldsa87.PublicKeySize || p.PeerID != protocol.ID(p.PublicKey).String() {
+	if len(p.PublicKey) != mldsa.MLDSA87PublicKeySize || p.PeerID != protocol.ID(p.PublicKey).String() {
 		return errors.New("peer identity key/PeerID mismatch")
 	}
 	if p.Endpoint != "" {
@@ -172,7 +172,7 @@ func (s Store) Init(ctx context.Context, name, kind string) error {
 			kind = "secure-enclave"
 		}
 	}
-	f := IdentityFile{Version: 1, Name: name, Provider: kind, Node: key.NewNode()}
+	f := IdentityFile{Version: 2, Name: name, Provider: kind, Node: key.NewNode()}
 	switch kind {
 	case "software":
 		i, err := software.Generate()
@@ -205,7 +205,10 @@ func (s Store) Identity(ctx context.Context) (provider.Identity, provider.NewKEM
 		return nil, nil, f, func() {}, err
 	}
 	defer clear(f.Private)
-	if f.Version != 1 || f.Node.IsZero() {
+	if f.Version != 2 {
+		return nil, nil, f, func() {}, errors.New("unsupported identity file version; reinitialize and re-pair after the v0.0.1 crypto migration")
+	}
+	if f.Node.IsZero() {
 		return nil, nil, f, func() {}, errors.New("invalid identity file")
 	}
 	switch f.Provider {

@@ -57,10 +57,10 @@ func (t *Tunnel) Configure(local netip.Addr) error {
 	if runtime.GOOS == "darwin" {
 		return command("/sbin/ifconfig", t.Name, "inet6", local.String(), "prefixlen", "128", "up")
 	}
-	if err := command("ip", "-6", "addr", "add", local.String()+"/128", "dev", t.Name); err != nil {
+	if err := command("/sbin/ip", "-6", "addr", "add", local.String()+"/128", "dev", t.Name); err != nil {
 		return err
 	}
-	return command("ip", "link", "set", "dev", t.Name, "up")
+	return command("/sbin/ip", "link", "set", "dev", t.Name, "up")
 }
 func (t *Tunnel) Peer(addr netip.Addr, add bool) error {
 	t.mu.Lock()
@@ -79,7 +79,7 @@ func (t *Tunnel) Peer(addr netip.Addr, add bool) error {
 	if runtime.GOOS == "darwin" {
 		err = command("/sbin/route", "-n", verb, "-inet6", addr.String(), "-interface", t.Name)
 	} else {
-		err = command("ip", "-6", "route", verb, addr.String()+"/128", "dev", t.Name)
+		err = command("/sbin/ip", "-6", "route", verb, addr.String()+"/128", "dev", t.Name)
 	}
 	if err == nil {
 		if add {

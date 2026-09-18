@@ -4,42 +4,37 @@ import (
 	"context"
 	"crypto/hkdf"
 	"crypto/hmac"
+	"crypto/mldsa"
+	"crypto/mlkem"
 	"crypto/rand"
-	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"errors"
 	"sync"
 	"time"
 
-	"github.com/cloudflare/circl/kem/mlkem/mlkem1024"
-	"github.com/cloudflare/circl/sign/mldsa/mldsa87"
 	"github.com/ekarulf/quantumcat/internal/crypto/provider"
 )
 
 var ErrRejected = errors.New("handshake rejected")
 
-func derive(ss []byte, hash [32]byte) (psk, confirmation [32]byte) {
-	prk, err := hkdf.Extract(sha256.New, ss, hash[:])
+func derive(ss []byte, hash [hashSize]byte) (psk, confirmation [32]byte, err error) {
+	p, err := hkdf.Expand(sha512.New384, ss, "qcat-wireguard-psk-v2"+string(hash[:]), 32)
 	if err != nil {
-		panic("HKDF extract failed: " + err.Error())
+		return psk, confirmation, err
 	}
-	defer clear(prk)
-	p, err := hkdf.Expand(sha256.New, prk, "qcat-wireguard-psk-v1", 32)
+	defer clear(p)
+	c, err := hkdf.Expand(sha512.New384, ss, "qcat-handshake-confirm-v2"+string(hash[:]), 32)
 	if err != nil {
-		panic("HKDF PSK expansion failed: " + err.Error())
+		return psk, confirmation, err
 	}
-	c, err := hkdf.Expand(sha256.New, prk, "qcat-handshake-confirm-v1", 32)
-	if err != nil {
-		panic("HKDF confirmation expansion failed: " + err.Error())
-	}
+	defer clear(c)
 	copy(psk[:], p)
 	copy(confirmation[:], c)
-	clear(p)
-	clear(c)
-	return
+	return psk, confirmation, nil
 }
-func proof(k [32]byte, label string, hash [32]byte) []byte {
-	m := hmac.New(sha256.New, k[:])
+func proof(k [32]byte, label string, hash [hashSize]byte) []byte {
+	m := hmac.New(sha512.New384, k[:])
 	m.Write([]byte(label))
 	m.Write(hash[:])
 	return m.Sum(nil)
@@ -56,7 +51,7 @@ type Client struct {
 }
 
 func NewClient(ctx context.Context, identity provider.Identity, newKEM provider.NewKEM, serverPublic []byte, local, remote Keys, now time.Time) (*Client, []byte, error) {
-	if len(serverPublic) != mldsa87.PublicKeySize {
+	if len(serverPublic) != mldsa.MLDSA87PublicKeySize {
 		return nil, nil, ErrRejected
 	}
 	pub, err := identity.PublicKey(ctx)
@@ -72,7 +67,7 @@ func NewClient(ctx context.Context, identity provider.Identity, newKEM provider.
 	if err != nil {
 		return fail(err)
 	}
-	if len(kp) != mlkem1024.PublicKeySize {
+	if len(kp) != mlkem.EncapsulationKeySize1024 {
 		return fail(ErrRejected)
 	}
 	id, sid := ID(pub), ID(serverPublic)
@@ -100,10 +95,10 @@ func (c *Client) Complete(ctx context.Context, packet []byte) ([32]byte, []byte,
 	if !hmac.Equal(b[:32], c.server[:]) || !hmac.Equal(b[32:64], c.keys.WG[:]) || !hmac.Equal(b[64:96], c.keys.Disco[:]) {
 		return zero, nil, ErrRejected
 	}
-	ct := b[128 : 128+mlkem1024.CiphertextSize]
+	ct := b[128 : 128+mlkem.CiphertextSize1024]
 	hash := transcript(c.hello, c.server, c.keys, b[96:128], ct)
-	sigEnd := len(b) - 32
-	if !verify(c.serverPublic, ServerContext, hash[:], b[128+mlkem1024.CiphertextSize:sigEnd]) {
+	sigEnd := len(b) - proofSize
+	if !verify(c.serverPublic, ServerContext, hash[:], b[128+mlkem.CiphertextSize1024:sigEnd]) {
 		return zero, nil, ErrRejected
 	}
 	ss, err := c.kem.Decapsulate(ctx, ct)
@@ -111,7 +106,10 @@ func (c *Client) Complete(ctx context.Context, packet []byte) ([32]byte, []byte,
 		return zero, nil, err
 	}
 	defer clear(ss)
-	psk, hk := derive(ss, hash)
+	psk, hk, err := derive(ss, hash)
+	if err != nil {
+		return zero, nil, err
+	}
 	defer clear(psk[:])
 	defer clear(hk[:])
 	if !hmac.Equal(proof(hk, "server-finished", hash), b[sigEnd:]) {
@@ -134,12 +132,13 @@ type Session struct {
 }
 type pending struct {
 	session    Session
-	hash, hk   [32]byte
+	hash       [hashSize]byte
+	hk         [32]byte
 	source     [32]byte
 	expires    time.Time
 	accepted   bool
 	installing bool
-	helloHash  [32]byte
+	helloHash  [hashSize]byte
 	response   []byte
 }
 type bucket struct {
@@ -153,8 +152,8 @@ type Server struct {
 	Keys     Keys
 	// Lookup must use the full PeerID and return nil for revoked/unknown peers.
 	Lookup     func(PeerID) []byte
-	pending    map[[32]byte]*pending
-	replay     map[[32]byte]time.Time
+	pending    map[[hashSize]byte]*pending
+	replay     map[[hashSize]byte]time.Time
 	limits     map[[32]byte]bucket
 	peerLimits map[[32]byte]bucket
 	global     bucket
@@ -174,6 +173,13 @@ func (s *Server) Expire(now time.Time) {
 	for h, t := range s.replay {
 		if !now.Before(t) {
 			delete(s.replay, h)
+		}
+	}
+	for _, limits := range []map[[32]byte]bucket{s.limits, s.peerLimits} {
+		for h, t := range limits {
+			if now.Sub(t.start) > time.Second {
+				delete(limits, h)
+			}
 		}
 	}
 }
@@ -233,9 +239,9 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		}
 	}
 	if kind == ClientFinish {
-		h := [32]byte(b[:32])
+		h := [hashSize]byte(b[:hashSize])
 		p := s.pending[h]
-		if p == nil || p.source != source || len(s.Lookup(p.session.Peer)) == 0 || !hmac.Equal(proof(p.hk, "client-finished", h), b[32:]) {
+		if p == nil || p.source != source || len(s.Lookup(p.session.Peer)) == 0 || !hmac.Equal(proof(p.hk, "client-finished", h), b[hashSize:]) {
 			return nil, nil
 		}
 		ack := frame(ServerAccepted, join(h[:], proof(p.hk, "server-accepted", h)))
@@ -286,6 +292,8 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	}
 	id := PeerID(b[:32])
 	pub := s.Lookup(id)
+	// Version 1 assigns no semantics to the reserved bytes. The complete hello
+	// is transcript-bound, but non-zero extensions still require a new version.
 	if len(pub) == 0 || ID(pub) != id || source != [32]byte(b[32:64]) || [32]byte(b[64:96]) == [32]byte{} || PeerID(b[128:160]) != ID(s.Public) || [32]byte(b[160:192]) != [32]byte{} {
 		return nil, nil
 	}
@@ -299,7 +307,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		s.peerLimits = make(map[[32]byte]bucket)
 	}
 	if _, exists := s.limits[source]; !exists && len(s.limits) >= 4096 {
-		return nil, nil
+		evictOldest(s.limits)
 	}
 	// Charge a sender's quota before the shared verification budget. Claimed
 	// identities must not consume another device's quota before authentication.
@@ -311,9 +319,9 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	if !ok {
 		return nil, nil
 	}
-	replay := sha256.Sum256(join(id[:], b[96:128]))
+	replay := sha512.Sum384(join(id[:], b[96:128]))
 	if _, ok := s.replay[replay]; ok {
-		digest := sha256.Sum256(packet)
+		digest := sha512.Sum384(packet)
 		for _, p := range s.pending {
 			if p.source == source && p.helloHash == digest {
 				return append([]byte(nil), p.response...), nil
@@ -331,7 +339,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		return nil, nil
 	}
 	if _, exists := s.peerLimits[[32]byte(id)]; !exists && len(s.peerLimits) >= 4096 {
-		return nil, nil
+		evictOldest(s.peerLimits)
 	}
 	s.peerLimits[[32]byte(id)], ok = allow(s.peerLimits[[32]byte(id)], now, 4)
 	if !ok {
@@ -346,14 +354,11 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	if owned >= 8 {
 		return nil, nil
 	}
-	kp, err := mlkem1024.Scheme().UnmarshalBinaryPublicKey(hello[200:])
+	kp, err := mlkem.NewEncapsulationKey1024(hello[200:])
 	if err != nil {
 		return nil, nil
 	}
-	ct, ss, err := mlkem1024.Scheme().Encapsulate(kp)
-	if err != nil {
-		return nil, nil
-	}
+	ss, ct := kp.Encapsulate()
 	defer clear(ss)
 	nonce := make([]byte, 32)
 	if _, err = rand.Read(nonce); err != nil {
@@ -361,7 +366,10 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	}
 	sid := ID(s.Public)
 	hash := transcript(hello, sid, s.Keys, nonce, ct)
-	psk, hk := derive(ss, hash)
+	psk, hk, err := derive(ss, hash)
+	if err != nil {
+		return nil, nil
+	}
 	defer clear(psk[:])
 	defer clear(hk[:])
 	sig, err := s.Identity.Sign(ctx, ServerContext, hash[:])
@@ -371,11 +379,24 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		return nil, nil
 	}
 	if s.pending == nil {
-		s.pending = make(map[[32]byte]*pending)
-		s.replay = make(map[[32]byte]time.Time)
+		s.pending = make(map[[hashSize]byte]*pending)
+		s.replay = make(map[[hashSize]byte]time.Time)
 	}
 	response := frame(ServerHello, join(sid[:], s.Keys.WG[:], s.Keys.Disco[:], nonce, ct, sig, proof(hk, "server-finished", hash)))
-	s.pending[hash] = &pending{session: Session{Peer: id, Keys: Keys{[32]byte(b[32:64]), [32]byte(b[64:96])}, PSK: psk}, hash: hash, hk: hk, source: source, expires: now.Add(30 * time.Second), helloHash: sha256.Sum256(packet), response: response}
+	s.pending[hash] = &pending{session: Session{Peer: id, Keys: Keys{[32]byte(b[32:64]), [32]byte(b[64:96])}, PSK: psk}, hash: hash, hk: hk, source: source, expires: now.Add(30 * time.Second), helloHash: sha512.Sum384(packet), response: response}
 	s.replay[replay] = now.Add(5 * time.Minute)
 	return response, nil
+}
+
+func evictOldest(table map[[32]byte]bucket) {
+	var oldestKey [32]byte
+	var oldest time.Time
+	for key, value := range table {
+		if oldest.IsZero() || value.start.Before(oldest) {
+			oldestKey, oldest = key, value.start
+		}
+	}
+	if !oldest.IsZero() {
+		delete(table, oldestKey)
+	}
 }

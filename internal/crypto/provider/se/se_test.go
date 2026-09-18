@@ -12,7 +12,7 @@ import (
 	"github.com/ekarulf/quantumcat/internal/protocol"
 )
 
-func TestSecureEnclaveCIRCLInteroperability(t *testing.T) {
+func TestSecureEnclaveStandardLibraryInteroperability(t *testing.T) {
 	enabled, configured := os.LookupEnv("QCAT_TEST_ENCLAVE")
 	if !configured {
 		enabled = os.Getenv("QCAT_TEST_SE")
@@ -69,7 +69,7 @@ func TestSecureEnclaveCIRCLInteroperability(t *testing.T) {
 	defer c.Close()
 	reply, _ := server.Handle(ctx, local.WG, hello, time.Now())
 	if len(reply) == 0 {
-		t.Fatal("CIRCL rejected Secure Enclave signature")
+		t.Fatal("Go crypto rejected Secure Enclave signature")
 	}
 	psk, finish, err := c.Complete(ctx, reply)
 	if err != nil {
@@ -77,7 +77,7 @@ func TestSecureEnclaveCIRCLInteroperability(t *testing.T) {
 	}
 	ack, session := server.Handle(ctx, local.WG, finish, time.Now())
 	if session == nil || session.PSK != psk || !c.Accepted(ack) {
-		t.Fatal("Apple/CIRCL KEM key confirmation failed")
+		t.Fatal("Apple/Go crypto KEM key confirmation failed")
 	}
 	session.Installed(true)
 }

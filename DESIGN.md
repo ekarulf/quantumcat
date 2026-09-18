@@ -164,17 +164,18 @@ Apple exposes `SecureEnclave.MLDSA87.PrivateKey`, including signing and persiste
 
 On Linux or platforms without a Secure Enclave, use a software ML-DSA-87 key with strict filesystem permissions.
 
-Use Cloudflare CIRCL for the Go implementation. CIRCL currently exposes FIPS 204 ML-DSA-87.
+Use Go's `crypto/mldsa` implementation with the ML-DSA-87 parameter set. New
+software identities persist the standard library's 32-byte seed encoding.
 
 ### Identity ID
 
 Define:
 
 ```text
-PeerID = SHA-256(
+PeerID = Truncate256(SHA-384(
     "qcat-peer-v1" ||
     canonical_ml_dsa_87_public_key
-)
+))
 ```
 
 Display the ID in a human-friendly encoding such as:
@@ -419,7 +420,7 @@ Once ClientHello is authenticated, the server performs:
     MLKEM1024.Encapsulate(client_mlkem_public)
 ```
 
-On Go/Linux, use Cloudflare CIRCL's FIPS 203 ML-KEM-1024 implementation. CIRCL exposes `mlkem1024` directly.
+Use Go's `crypto/mlkem` ML-KEM-1024 implementation.
 
 Generate:
 
@@ -439,27 +440,19 @@ Canonical transcript:
 TranscriptV1 =
     protocol_version ||
     server_peer_id ||
-    client_peer_id ||
-
     server_wg_public ||
-    client_wg_public ||
-
     server_disco_public ||
-    client_disco_public ||
-
-    client_mlkem_public ||
+    server_nonce ||
     kem_ciphertext ||
-
-    client_nonce ||
-    server_nonce
+    complete_unsigned_client_hello
 ```
 
 Hash:
 
 ```text
 transcript_hash =
-    SHA-256(
-        "qcat-transcript-v1" ||
+    SHA-384(
+        "qcat-transcript-v2" ||
         CanonicalEncode(TranscriptV1)
     )
 ```
@@ -485,20 +478,15 @@ ML-KEM produces a shared secret.
 Derive:
 
 ```text
-PRK = HKDF-Extract(
-    salt = transcript_hash,
-    IKM  = mlkem_shared_secret
-)
-
-wireguard_psk = HKDF-Expand(
-    PRK,
-    "qcat-wireguard-psk-v1",
+wireguard_psk = HKDF-SHA384-Expand(
+    mlkem_shared_secret,
+    "qcat-wireguard-psk-v2" || transcript_hash,
     32
 )
 
-handshake_key = HKDF-Expand(
-    PRK,
-    "qcat-handshake-confirm-v1",
+handshake_key = HKDF-SHA384-Expand(
+    mlkem_shared_secret,
+    "qcat-handshake-confirm-v2" || transcript_hash,
     32
 )
 ```
@@ -543,7 +531,7 @@ Use context:
 `server_proof` is:
 
 ```text
-HMAC-SHA256(
+HMAC-SHA384(
     handshake_key,
     "server-finished" || transcript_hash
 )
@@ -580,6 +568,7 @@ The client sends:
 
 ```text
 ClientFinish {
+    transcript_hash
     client_proof
 }
 ```
@@ -588,7 +577,7 @@ where:
 
 ```text
 client_proof =
-    HMAC-SHA256(
+    HMAC-SHA384(
         handshake_key,
         "client-finished" || transcript_hash
     )
@@ -760,7 +749,7 @@ Server should accept a narrow window, initially:
 Maintain a short in-memory replay cache:
 
 ```text
-SHA256(client_peer_id || client_nonce)
+SHA384(client_peer_id || client_nonce)
 ```
 
 for approximately five minutes.
@@ -1139,7 +1128,7 @@ internal/crypto/provider/se
 internal/crypto/provider/software
 ```
 
-Software implementation uses CIRCL.
+Software implementation uses Go's `crypto/mldsa` and `crypto/mlkem` packages.
 
 macOS implementation uses `qcat-se`.
 
@@ -1149,25 +1138,18 @@ This makes protocol tests platform-independent.
 
 # 35. Go crypto dependencies
 
-Use Cloudflare CIRCL for:
+Use the Go standard library for:
 
 ```text
 ML-KEM-1024
 ML-DSA-87
-```
-
-CIRCL currently exposes FIPS 203 ML-KEM-1024 and FIPS 204 ML-DSA-87 packages.
-
-Do not implement ML-KEM or ML-DSA directly.
-
-Use the Go standard library for:
-
-```text
-SHA-256
-HMAC-SHA-256
-HKDF where suitable
+SHA-384
+HMAC-SHA-384
+HKDF-Expand
 crypto/rand
 ```
+
+Do not implement ML-KEM or ML-DSA directly.
 
 ---
 
@@ -1290,7 +1272,7 @@ MaxKEMCiphertext   = implementation-specific constant
 MaxSignature       = implementation-specific constant
 ```
 
-Validate against CIRCL/Apple's expected exact sizes where possible.
+Validate against Go/Apple's expected exact sizes where possible.
 
 Reject trailing unexpected bytes.
 
@@ -1560,4 +1542,3 @@ Still:
 
 * limit lifetime of shared secrets
 * overwrite byte buffers wher
-

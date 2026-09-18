@@ -3,8 +3,8 @@ module github.com/ekarulf/quantumcat
 go 1.27.1
 
 require (
-	github.com/cloudflare/circl v1.6.5
 	github.com/tailscale/tailcat v0.6.0
+	github.com/tailscale/wireguard-go v0.0.0-20260904023712-e855235c55a2
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	tailscale.com v1.103.0-pre.0.20260904030409-31d8badb3bfb
 )
@@ -38,7 +38,6 @@ require (
 	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd // indirect
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20250124233751-d4cd19a26976 // indirect
-	github.com/tailscale/wireguard-go v0.0.0-20260904023712-e855235c55a2 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go4.org/netipx v0.0.0-20260823151212-3075585bcbeb // indirect
 	golang.org/x/crypto v0.55.0 // indirect

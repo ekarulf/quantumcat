@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/ekarulf/quantumcat/internal/crypto/provider"
+	"github.com/ekarulf/quantumcat/internal/trust"
 )
 
 type Helper struct {
@@ -29,13 +30,20 @@ func Open() (*Helper, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := trustedHelper(path); err != nil {
+		return nil, fmt.Errorf("untrusted Secure Enclave helper: %w", err)
+	}
 	return start(exec.Command(path))
 }
 
 func helperPath() (string, error) {
-	path := os.Getenv("QCAT_ENCLAVE_HELPER")
-	if path == "" {
-		path = os.Getenv("QCAT_SE_HELPER") // Compatibility with existing LaunchAgents.
+	var path string
+	// Environment-controlled executables must never cross a privilege boundary.
+	if os.Geteuid() != 0 {
+		path = os.Getenv("QCAT_ENCLAVE_HELPER")
+		if path == "" {
+			path = os.Getenv("QCAT_SE_HELPER") // Compatibility with existing LaunchAgents.
+		}
 	}
 	if path == "" {
 		exe, err := os.Executable()
@@ -48,6 +56,20 @@ func helperPath() (string, error) {
 		return "", errors.New("QCAT_ENCLAVE_HELPER must be an absolute path")
 	}
 	return path, nil
+}
+
+func trustedHelper(path string) error {
+	if err := trust.Path(path, false); err != nil {
+		return err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode().Perm()&0111 == 0 {
+		return errors.New("helper is not executable")
+	}
+	return trust.Ancestors(path)
 }
 
 func start(cmd *exec.Cmd) (*Helper, error) {
