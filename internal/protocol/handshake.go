@@ -96,9 +96,9 @@ func (c *Client) Complete(ctx context.Context, packet []byte) ([32]byte, []byte,
 		return zero, nil, ErrRejected
 	}
 	ct := b[128 : 128+mlkem.CiphertextSize1024]
-	hash := transcript(c.hello, c.server, c.keys, b[96:128], ct)
+	tb, hash := transcript(c.hello, c.server, c.keys, b[96:128], ct)
 	sigEnd := len(b) - proofSize
-	if !verify(c.serverPublic, ServerContext, hash[:], b[128+mlkem.CiphertextSize1024:sigEnd]) {
+	if !verify(c.serverPublic, ServerContext, tb, b[128+mlkem.CiphertextSize1024:sigEnd]) {
 		return zero, nil, ErrRejected
 	}
 	ss, err := c.kem.Decapsulate(ctx, ct)
@@ -365,14 +365,14 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		return nil, nil
 	}
 	sid := ID(s.Public)
-	hash := transcript(hello, sid, s.Keys, nonce, ct)
+	tb, hash := transcript(hello, sid, s.Keys, nonce, ct)
 	psk, hk, err := derive(ss, hash)
 	if err != nil {
 		return nil, nil
 	}
 	defer clear(psk[:])
 	defer clear(hk[:])
-	sig, err := s.Identity.Sign(ctx, ServerContext, hash[:])
+	sig, err := s.Identity.Sign(ctx, ServerContext, tb)
 	if err != nil {
 		clear(psk[:])
 		clear(hk[:])

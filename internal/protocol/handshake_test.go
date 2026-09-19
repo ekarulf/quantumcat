@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ekarulf/quantumcat/internal/crypto/provider"
 	"github.com/ekarulf/quantumcat/internal/crypto/provider/software"
 )
 
@@ -240,6 +241,9 @@ func TestVersionOneSHA384Sizes(t *testing.T) {
 	if serverSize != 6371 || hashSize+proofSize != 96 {
 		t.Fatalf("unexpected payload sizes: server=%d finish=%d", serverSize, hashSize+proofSize)
 	}
+	if transcriptSize != 3483 || transcriptSize <= hashSize {
+		t.Fatalf("unexpected transcript size: %d", transcriptSize)
+	}
 }
 
 func TestPeerIDKnownAnswer(t *testing.T) {
@@ -255,13 +259,80 @@ func TestTranscriptCoversCompleteHello(t *testing.T) {
 	keys := Keys{WG: [32]byte{2}, Disco: [32]byte{3}}
 	nonce := make([]byte, 32)
 	ct := make([]byte, mlkem.CiphertextSize1024)
-	want := transcript(hello, server, keys, nonce, ct)
+	_, want := transcript(hello, server, keys, nonce, ct)
 	for i := range hello {
 		hello[i] ^= 1
-		if got := transcript(hello, server, keys, nonce, ct); got == want {
+		if _, got := transcript(hello, server, keys, nonce, ct); got == want {
 			t.Fatalf("hello byte %d is not transcript-bound", i)
 		}
 		hello[i] ^= 1
+	}
+}
+
+type recordingIdentity struct {
+	provider.Identity
+	label string
+	msg   []byte
+}
+
+func (r *recordingIdentity) Sign(ctx context.Context, label string, msg []byte) ([]byte, error) {
+	r.label, r.msg = label, append([]byte(nil), msg...)
+	return r.Identity.Sign(ctx, label, msg)
+}
+
+func TestServerSignsCanonicalTranscriptNotDigest(t *testing.T) {
+	s, c, hello, src, now := fixture(t)
+	ctx := context.Background()
+	recorder := &recordingIdentity{Identity: s.Identity}
+	s.Identity = recorder
+	reply, _ := s.Handle(ctx, src, hello, now)
+	if len(reply) == 0 {
+		t.Fatal("server rejected a valid hello")
+	}
+	if recorder.label != ServerContext {
+		t.Fatalf("signed under context %q, want %q", recorder.label, ServerContext)
+	}
+	_, b, err := Parse(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := b[128 : 128+mlkem.CiphertextSize1024]
+	tb, hash := transcript(c.hello, c.server, c.keys, b[96:128], ct)
+	if !bytes.Equal(recorder.msg, tb) {
+		t.Fatal("signature does not cover the canonical transcript")
+	}
+	if len(recorder.msg) != transcriptSize {
+		t.Fatalf("signed %d bytes, want %d", len(recorder.msg), transcriptSize)
+	}
+	if bytes.Equal(recorder.msg, hash[:]) {
+		t.Fatal("server pre-hashed the transcript before signing")
+	}
+	if !bytes.HasSuffix(recorder.msg, c.hello) {
+		t.Fatal("signed transcript does not end with the complete hello")
+	}
+}
+
+func TestClientRejectsDigestOnlyServerSignature(t *testing.T) {
+	s, c, hello, src, now := fixture(t)
+	ctx := context.Background()
+	reply, _ := s.Handle(ctx, src, hello, now)
+	if len(reply) == 0 {
+		t.Fatal("server rejected a valid hello")
+	}
+	_, b, err := Parse(reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ct := b[128 : 128+mlkem.CiphertextSize1024]
+	_, hash := transcript(c.hello, c.server, c.keys, b[96:128], ct)
+	legacy, err := s.Identity.Sign(ctx, ServerContext, hash[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := append([]byte(nil), reply...)
+	copy(forged[8+128+mlkem.CiphertextSize1024:], legacy)
+	if _, _, err := c.Complete(ctx, forged); err == nil {
+		t.Fatal("client accepted a signature over the digest alone")
 	}
 }
 

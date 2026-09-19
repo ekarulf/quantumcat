@@ -14,8 +14,10 @@ It reuses:
 * DERP for rendezvous and relay fallback
 * Tailscale/gVisor netstack where useful
 * Apple's Secure Enclave for hardware-backed post-quantum client identity and ephemeral key establishment
-* ML-DSA-87 for post-quantum device authentication
+* ML-DSA-87 for post-quantum device authentication, always pure (never pre-hashed)
 * ML-KEM-1024 for post-quantum session-secret establishment
+* SHA-384 for the transcript digest, HKDF and HMAC key confirmation
+* SHA-512/256 for stable PeerIDs, frozen independently of the wire suite
 
 Quantumcat should remain philosophically close to Tailcat:
 
@@ -431,7 +433,7 @@ Generate:
 server_nonce = random 32 bytes
 ```
 
-Compute the transcript hash.
+Build the canonical transcript bytes, then compute the transcript hash.
 
 ---
 
@@ -450,15 +452,34 @@ TranscriptV1 =
     complete_unsigned_client_hello
 ```
 
+The canonical transcript bytes are:
+
+```text
+transcript_bytes =
+    "qcat-transcript-v1" ||
+    CanonicalEncode(TranscriptV1)
+```
+
 Hash:
 
 ```text
 transcript_hash =
-    SHA-384(
-        "qcat-transcript-v2" ||
-        CanonicalEncode(TranscriptV1)
-    )
+    SHA-384(transcript_bytes)
 ```
+
+These values have separate consumers:
+
+| Value | Width | Consumed by |
+| --- | --- | --- |
+| `transcript_bytes` | 3483 | the server's pure ML-DSA-87 signature only |
+| `transcript_hash` | 48 | HKDF info, HMAC confirmation, ClientFinish and ServerAccepted payloads, pending and replay keys |
+
+The server signs the canonical bytes rather than their digest. FIPS 204 §5.4
+prefers pure ML-DSA and requires an application-level digest to provide at
+least λ bits of both collision and second-preimage strength. For ML-DSA-87,
+λ is 256, so preserving its full strength with a conventional hash digest
+would require at least 512 output bits. SHA-384 remains the transcript digest
+for the separate key-schedule, confirmation and session-state uses above.
 
 Never concatenate variable-length fields without explicit lengths or canonical serialization.
 
@@ -523,7 +544,8 @@ ServerHello {
 }
 ```
 
-`server_signature` is an ML-DSA-87 signature over the handshake transcript.
+`server_signature` is a pure ML-DSA-87 signature over `transcript_bytes` — the
+canonical transcript itself, not `transcript_hash`.
 
 Use context:
 
@@ -552,13 +574,14 @@ The client:
 
 ```text
 1. Verify server_peer_id matches configured peer.
-2. Verify the ML-DSA-87 server signature.
-3. Send kem_ciphertext to Secure Enclave ML-KEM decapsulation.
-4. Receive shared secret.
-5. Recompute transcript_hash.
-6. Derive wireguard_psk.
-7. Derive handshake_key.
-8. Verify server_proof.
+2. Rebuild transcript_bytes from the received ServerHello and its own hello.
+3. Verify the pure ML-DSA-87 server signature over transcript_bytes.
+4. Send kem_ciphertext to Secure Enclave ML-KEM decapsulation.
+5. Receive shared secret.
+6. Compute transcript_hash = SHA-384(transcript_bytes).
+7. Derive wireguard_psk.
+8. Derive handshake_key.
+9. Verify server_proof.
 ```
 
 Only after all checks pass may the client configure its WireGuard peer.

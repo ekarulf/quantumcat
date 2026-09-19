@@ -1,7 +1,10 @@
 # Quantumcat bootstrap v1
 
-This pre-release definition freezes PeerID at SHA-512/256. It is not
-identity-file- or pairing-compatible with earlier builds.
+This pre-release definition freezes PeerID at SHA-512/256 and makes the server
+sign the canonical transcript bytes with pure ML-DSA-87 instead of their
+digest. The PeerID change is not identity-file- or pairing-compatible with
+earlier builds. The signature change is wire-incompatible but needs no
+additional re-pairing: identity keys and PeerIDs are unaffected.
 
 Network frames: ASCII `QCAT`, version byte `1`, message-type byte, big-endian
 uint16 payload length, payload. The header is eight bytes. Hard limit: 32768
@@ -23,16 +26,28 @@ PeerID is SHA-512/256 over `qcat-peer-v1` followed by that key. This derivation
 is frozen independently of the wire suite. Text IDs use `qpeer:` plus unpadded
 uppercase RFC 4648 base32. All 32 identifier bytes are retained.
 
-Transcript hash is SHA-384 over this fixed concatenation:
+The canonical transcript is this fixed **3483-byte** concatenation:
 
 ```text
-"qcat-transcript-v2" || version_byte ||
+"qcat-transcript-v1" || version_byte ||
 server_peer_id || server_wg_public || server_disco_public ||
 server_nonce || kem_ciphertext || complete_unsigned_client_hello
 ```
 
 The complete unsigned ClientHello includes its timestamp and reserved bytes.
-ServerHello signs the 48-byte hash with context `qcat-handshake-server-v1`.
+The transcript serves two distinct roles:
+
+* **ServerHello signs the canonical transcript bytes themselves** with pure
+  ML-DSA-87 under the application context `qcat-handshake-server-v1`. It does
+  **not** sign a digest. FIPS 204 §5.4 prefers pure ML-DSA and requires an
+  application-level pre-hash to provide λ bits of both collision and
+  second-preimage strength. For ML-DSA-87, λ is 256, so a conventional digest
+  would need at least 512 output bits to preserve the signature scheme's full
+  strength.
+* **The transcript hash is SHA-384 of those same bytes**, 48 bytes wide. It is
+  used in HKDF info, HMAC confirmation, ClientFinish and ServerAccepted, and
+  the pending and replay tables; it is not the signed message.
+
 Because the ML-KEM shared secret is already pseudorandom, HKDF-Expand with
 SHA-384 derives separate 32-byte keys directly. Its info strings are
 `qcat-wireguard-psk-v2 || transcript_hash` and

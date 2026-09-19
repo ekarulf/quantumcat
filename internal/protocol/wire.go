@@ -12,19 +12,21 @@ import (
 )
 
 const (
-	Version        = 1
-	MaxPacket      = 32768
-	ClientHello    = 1
-	ServerHello    = 2
-	ClientFinish   = 3
-	ServerAccepted = 4
-	hashSize       = sha512.Size384
-	proofSize      = sha512.Size384
-	helloSize      = 32*6 + 8 + mlkem.EncapsulationKeySize1024
-	serverSize     = 32*4 + mlkem.CiphertextSize1024 + mldsa.MLDSA87SignatureSize + proofSize
-	ClientContext  = "qcat-handshake-client-v1"
-	ServerContext  = "qcat-handshake-server-v1"
-	peerIDDomain   = "qcat-peer-v1" // Frozen independently of Version.
+	Version          = 1
+	MaxPacket        = 32768
+	ClientHello      = 1
+	ServerHello      = 2
+	ClientFinish     = 3
+	ServerAccepted   = 4
+	hashSize         = sha512.Size384
+	proofSize        = sha512.Size384
+	helloSize        = 32*6 + 8 + mlkem.EncapsulationKeySize1024
+	serverSize       = 32*4 + mlkem.CiphertextSize1024 + mldsa.MLDSA87SignatureSize + proofSize
+	transcriptSize   = len(transcriptDomain) + 1 + 32*4 + mlkem.CiphertextSize1024 + helloSize
+	ClientContext    = "qcat-handshake-client-v1"
+	ServerContext    = "qcat-handshake-server-v1"
+	peerIDDomain     = "qcat-peer-v1" // Frozen independently of Version.
+	transcriptDomain = "qcat-transcript-v1"
 )
 
 type PeerID [32]byte
@@ -95,9 +97,15 @@ func verify(pub []byte, label string, msg, sig []byte) bool {
 	p, err := mldsa.NewPublicKey(mldsa.MLDSA87(), pub)
 	return err == nil && mldsa.Verify(p, msg, sig, &mldsa.Options{Context: label}) == nil
 }
-func transcript(hello []byte, server PeerID, keys Keys, nonce, ct []byte) [hashSize]byte {
-	// Hash the complete signed hello so future fields cannot be authenticated
+
+// transcript returns the canonical transcript bytes and their SHA-384 digest.
+// Both come from one function so the signature and key schedule cannot drift:
+// the server signs the bytes, while confirmation and session state use the
+// digest.
+func transcript(hello []byte, server PeerID, keys Keys, nonce, ct []byte) ([]byte, [hashSize]byte) {
+	// Cover the complete signed hello so future fields cannot be authenticated
 	// by the client yet omitted from the server's attestation and key schedule.
-	return sha512.Sum384(join([]byte("qcat-transcript-v2"), []byte{Version}, server[:],
-		keys.WG[:], keys.Disco[:], nonce, ct, hello))
+	b := join([]byte(transcriptDomain), []byte{Version}, server[:],
+		keys.WG[:], keys.Disco[:], nonce, ct, hello)
+	return b, sha512.Sum384(b)
 }

@@ -80,4 +80,37 @@ func TestSecureEnclaveStandardLibraryInteroperability(t *testing.T) {
 		t.Fatal("Apple/Go crypto KEM key confirmation failed")
 	}
 	session.Installed(true)
+
+	// Exercise the Enclave as the server signer too. ServerHello signs the
+	// complete 3,483-byte canonical transcript rather than its 48-byte digest.
+	var clientKeys, serverKeys protocol.Keys
+	rand.Read(clientKeys.WG[:])
+	rand.Read(clientKeys.Disco[:])
+	rand.Read(serverKeys.WG[:])
+	rand.Read(serverKeys.Disco[:])
+	enclaveServer := &protocol.Server{Identity: h, Public: pub, Keys: serverKeys, Lookup: func(id protocol.PeerID) []byte {
+		if id == protocol.ID(sp) {
+			return sp
+		}
+		return nil
+	}}
+	defer enclaveServer.Close()
+	softwareClient, clientHello, err := protocol.NewClient(ctx, si, software.NewKEM, pub, clientKeys, serverKeys, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer softwareClient.Close()
+	serverReply, _ := enclaveServer.Handle(ctx, clientKeys.WG, clientHello, time.Now())
+	if len(serverReply) == 0 {
+		t.Fatal("Secure Enclave failed to sign the canonical server transcript")
+	}
+	serverPSK, clientFinish, err := softwareClient.Complete(ctx, serverReply)
+	if err != nil {
+		t.Fatal("Go crypto rejected Secure Enclave server signature:", err)
+	}
+	serverAck, serverSession := enclaveServer.Handle(ctx, clientKeys.WG, clientFinish, time.Now())
+	if serverSession == nil || serverSession.PSK != serverPSK || !softwareClient.Accepted(serverAck) {
+		t.Fatal("Secure Enclave server key confirmation failed")
+	}
+	serverSession.Installed(true)
 }
