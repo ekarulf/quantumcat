@@ -222,7 +222,11 @@ func mosh(parent context.Context, s config.Store, args []string) error {
 	renewDone, forwardDone := make(chan struct{}), make(chan error, 1)
 	go func() {
 		defer close(renewDone)
-		transport.Maintain(ctx, c, func(err error) { fmt.Fprintln(os.Stderr, "qcat: tunnel recovery/renewal failed; retrying:", err) })
+		// mosh-client owns this terminal from here on, so a recovery notice on
+		// stderr lands on top of the remote screen and the prompt redraws over
+		// it -- and it repeats every retry. Recovery is already automatic, so
+		// drop the notice rather than corrupt the session the tunnel carries.
+		transport.Maintain(ctx, c, nil)
 	}()
 	defer func() { cancel(); <-renewDone }()
 	session, err := bootstrapMosh(ctx, ssh, *host, *server, *serverPort, command)
