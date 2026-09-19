@@ -168,7 +168,7 @@ func identity(ctx context.Context, s config.Store, args []string) error {
 	if err != nil {
 		return err
 	}
-	return emit(config.Peer{Version: 1, Name: meta.Name, PeerID: protocol.ID(pub).String(), PublicKey: pub})
+	return emit(config.Peer{Version: config.PeerVersion, Name: meta.Name, PeerID: protocol.ID(pub).String(), PublicKey: pub})
 }
 func peers(s config.Store, args []string) error {
 	if len(args) == 0 {
@@ -335,7 +335,7 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 		return err
 	}
 	defer closeControl()
-	descriptor := config.Peer{Version: 1, Name: meta.Name, PeerID: protocol.ID(pub).String(), PublicKey: pub, Endpoint: server.TailcatAddr()}
+	descriptor := config.Peer{Version: config.PeerVersion, Name: meta.Name, PeerID: protocol.ID(pub).String(), PublicKey: pub, Endpoint: server.TailcatAddr()}
 	if err = descriptor.Validate(); err != nil {
 		return err
 	}

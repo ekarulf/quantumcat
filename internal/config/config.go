@@ -21,7 +21,11 @@ import (
 	"tailscale.com/types/key"
 )
 
-const MaxFile = 128 * 1024
+const (
+	MaxFile         = 128 * 1024
+	IdentityVersion = 3
+	PeerVersion     = 1
+)
 
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
 
@@ -47,7 +51,7 @@ type Peer struct {
 }
 
 func (p Peer) Validate() error {
-	if p.Version != 1 {
+	if p.Version != PeerVersion {
 		return errors.New("unsupported peer version")
 	}
 	if err := CheckName(p.Name); err != nil {
@@ -172,7 +176,7 @@ func (s Store) Init(ctx context.Context, name, kind string) error {
 			kind = "secure-enclave"
 		}
 	}
-	f := IdentityFile{Version: 2, Name: name, Provider: kind, Node: key.NewNode()}
+	f := IdentityFile{Version: IdentityVersion, Name: name, Provider: kind, Node: key.NewNode()}
 	switch kind {
 	case "software":
 		i, err := software.Generate()
@@ -205,8 +209,8 @@ func (s Store) Identity(ctx context.Context) (provider.Identity, provider.NewKEM
 		return nil, nil, f, func() {}, err
 	}
 	defer clear(f.Private)
-	if f.Version != 2 {
-		return nil, nil, f, func() {}, errors.New("unsupported identity file version; reinitialize and re-pair after the v0.0.1 crypto migration")
+	if f.Version != IdentityVersion {
+		return nil, nil, f, func() {}, errors.New("unsupported identity file version; reinitialize and re-pair for the SHA-512/256 PeerID migration")
 	}
 	if f.Node.IsZero() {
 		return nil, nil, f, func() {}, errors.New("invalid identity file")

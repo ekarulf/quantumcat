@@ -239,7 +239,7 @@ func TestMoshSessionWithMockExecutables(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	p := config.Peer{Version: 1, Name: "mini", PeerID: protocol.ID(sp).String(), PublicKey: sp, Endpoint: server.TailcatAddr()}
+	p := config.Peer{Version: config.PeerVersion, Name: "mini", PeerID: protocol.ID(sp).String(), PublicKey: sp, Endpoint: server.TailcatAddr()}
 	if err := config.WriteNew(filepath.Join(s.Dir, "peers", "mini.qpeer"), p); err != nil {
 		t.Fatal(err)
 	}

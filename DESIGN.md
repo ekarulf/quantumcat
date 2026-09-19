@@ -172,10 +172,10 @@ software identities persist the standard library's 32-byte seed encoding.
 Define:
 
 ```text
-PeerID = Truncate256(SHA-384(
+PeerID = SHA-512/256(
     "qcat-peer-v1" ||
     canonical_ml_dsa_87_public_key
-))
+)
 ```
 
 Display the ID in a human-friendly encoding such as:
@@ -185,6 +185,9 @@ qpeer:7CJ3-2FPG-...
 ```
 
 Internally retain all 32 bytes.
+
+This PeerID derivation is frozen independently of the wire-protocol version.
+Protocol-suite upgrades do not change an identity's PeerID.
 
 Do not use a truncated identifier as the authorization key.
 
@@ -1143,6 +1146,7 @@ Use the Go standard library for:
 ```text
 ML-KEM-1024
 ML-DSA-87
+SHA-512/256 for stable PeerIDs
 SHA-384
 HMAC-SHA-384
 HKDF-Expand

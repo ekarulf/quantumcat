@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/mlkem"
 	"crypto/rand"
+	"crypto/sha512"
 	"encoding/hex"
 	"testing"
 	"time"
@@ -229,6 +230,22 @@ func TestValidFrame(t *testing.T) {
 	}
 	if ValidFrame(append(valid, 0)) {
 		t.Fatal("wrong-sized frame accepted")
+	}
+}
+
+func TestVersionOneSHA384Sizes(t *testing.T) {
+	if Version != 1 || hashSize != sha512.Size384 || proofSize != sha512.Size384 {
+		t.Fatalf("unexpected suite constants: version=%d hash=%d proof=%d", Version, hashSize, proofSize)
+	}
+	if serverSize != 6371 || hashSize+proofSize != 96 {
+		t.Fatalf("unexpected payload sizes: server=%d finish=%d", serverSize, hashSize+proofSize)
+	}
+}
+
+func TestPeerIDKnownAnswer(t *testing.T) {
+	id := ID([]byte("test-public-key"))
+	if got, want := hex.EncodeToString(id[:]), "6df04077360795c911785203700a30d0af82120bdc2f9d397812b86a3d6ed117"; got != want {
+		t.Fatalf("PeerID = %s, want %s", got, want)
 	}
 }
 

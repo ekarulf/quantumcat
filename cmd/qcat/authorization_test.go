@@ -39,7 +39,7 @@ func TestReloadFailsClosedAndReportsRecovery(t *testing.T) {
 	defer close()
 	pub, _ := i.PublicKey(ctx)
 	path := filepath.Join(s.Dir, "peers", "valid.qpeer")
-	if err := config.WriteNew(path, config.Peer{Version: 1, Name: "valid", PeerID: protocol.ID(pub).String(), PublicKey: pub}); err != nil {
+	if err := config.WriteNew(path, config.Peer{Version: config.PeerVersion, Name: "valid", PeerID: protocol.ID(pub).String(), PublicKey: pub}); err != nil {
 		t.Fatal(err)
 	}
 	var log bytes.Buffer

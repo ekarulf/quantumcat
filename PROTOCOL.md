@@ -1,7 +1,7 @@
 # Quantumcat bootstrap v1
 
-This pre-release definition intentionally replaces the original SHA-256-based
-version 1 and is not wire- or pairing-compatible with builds through v0.0.1.
+This pre-release definition freezes PeerID at SHA-512/256. It is not
+identity-file- or pairing-compatible with earlier builds.
 
 Network frames: ASCII `QCAT`, version byte `1`, message-type byte, big-endian
 uint16 payload length, payload. The header is eight bytes. Hard limit: 32768
@@ -19,9 +19,9 @@ ClientHello signs its unsigned frame, whose header payload length is **1768**
 (not the transmitted length 6395), with ML-DSA context
 `qcat-handshake-client-v1`. Reserved bytes must be zero.
 Public ML-DSA keys are 2592 bytes, obtained from the local pairing store.
-PeerID is the first 32 bytes of SHA-384 over `qcat-peer-v1` followed by that
-key. Text IDs use `qpeer:` plus unpadded uppercase RFC 4648 base32. All 32
-identifier bytes are retained.
+PeerID is SHA-512/256 over `qcat-peer-v1` followed by that key. This derivation
+is frozen independently of the wire suite. Text IDs use `qpeer:` plus unpadded
+uppercase RFC 4648 base32. All 32 identifier bytes are retained.
 
 Transcript hash is SHA-384 over this fixed concatenation:
 
@@ -36,7 +36,7 @@ ServerHello signs the 48-byte hash with context `qcat-handshake-server-v1`.
 Because the ML-KEM shared secret is already pseudorandom, HKDF-Expand with
 SHA-384 derives separate 32-byte keys directly. Its info strings are
 `qcat-wireguard-psk-v2 || transcript_hash` and
-`qcat-handshake-confirm-v2 || transcript_hash`. Proofs use HMAC-SHA384 under
+`qcat-handshake-confirm-v2 || transcript_hash`. Proofs use HMAC-SHA-384 under
 the confirmation key over a label followed by the transcript hash. Labels:
 `server-finished`, `client-finished`, `server-accepted`.
 
