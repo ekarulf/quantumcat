@@ -24,13 +24,13 @@ const (
 	serverSize     = 32*4 + mlkem.CiphertextSize1024 + mldsa.MLDSA87SignatureSize + proofSize
 	ClientContext  = "qcat-handshake-client-v1"
 	ServerContext  = "qcat-handshake-server-v1"
+	peerIDDomain   = "qcat-peer-v1" // Frozen independently of Version.
 )
 
 type PeerID [32]byte
 
 func ID(pub []byte) PeerID {
-	digest := sha512.Sum384(append([]byte("qcat-peer-v1"), pub...))
-	return PeerID(digest[:32])
+	return sha512.Sum512_256(append([]byte(peerIDDomain), pub...))
 }
 func (p PeerID) String() string {
 	return "qpeer:" + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(p[:])
