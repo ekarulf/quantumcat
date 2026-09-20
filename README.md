@@ -145,15 +145,18 @@ Current build targets:
 | FreeBSD amd64 | `qcat-freebsd-amd64.tar.gz` |
 
 Verify the archive before extracting it. `SHA256SUMS` lists every archive, so
-`--ignore-missing` skips the platforms you did not download:
+select the line for the one you downloaded:
 
 ```sh
 # macOS
-shasum -a 256 --ignore-missing -c SHA256SUMS
+grep qcat-darwin-arm64.tar.gz SHA256SUMS | shasum -a 256 -c
 
 # Linux / FreeBSD
-sha256sum --ignore-missing -c SHA256SUMS
+grep qcat-linux-amd64.tar.gz SHA256SUMS | sha256sum -c
 ```
+
+Both print `OK` and exit 0. A mismatch, or a filename that matches no line,
+exits non-zero.
 
 Then install `qcat` somewhere on your `PATH`, for example:
 
