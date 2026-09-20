@@ -133,7 +133,7 @@ For the full protocol and threat-model details, see:
 
 ## Install
 
-Download the archive and matching `.sha256` file from [GitHub Releases](https://github.com/ekarulf/quantumcat/releases).
+Download the archive and `SHA256SUMS` from [GitHub Releases](https://github.com/ekarulf/quantumcat/releases).
 
 Current build targets:
 
@@ -144,14 +144,15 @@ Current build targets:
 | Linux ARM64 | `qcat-linux-arm64.tar.gz` |
 | FreeBSD amd64 | `qcat-freebsd-amd64.tar.gz` |
 
-Verify the archive before extracting it:
+Verify the archive before extracting it. `SHA256SUMS` lists every archive, so
+`--ignore-missing` skips the platforms you did not download:
 
 ```sh
 # macOS
-shasum -a 256 -c qcat-darwin-arm64.tar.gz.sha256
+shasum -a 256 --ignore-missing -c SHA256SUMS
 
 # Linux / FreeBSD
-sha256sum -c qcat-linux-amd64.tar.gz.sha256
+sha256sum --ignore-missing -c SHA256SUMS
 ```
 
 Then install `qcat` somewhere on your `PATH`, for example:

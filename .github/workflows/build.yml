@@ -100,7 +100,10 @@ jobs:
           test "${#sums[@]}" -eq 4
           cat "${sums[@]}" > SHA256SUMS
           sha256sum --check --strict SHA256SUMS
+          # The per-archive .sha256 files exist only to carry each build job's
+          # digest here; SHA256SUMS covers every archive, so publishing both
+          # would just give readers two things to disagree.
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "$GITHUB_REF_NAME" --draft --generate-notes \
-            "${archives[@]}" "${sums[@]}" SHA256SUMS
+            "${archives[@]}" SHA256SUMS
