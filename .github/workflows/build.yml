@@ -61,6 +61,10 @@ jobs:
       - name: Build and package
         env:
           TARGET: ${{ matrix.target }}
+          # Tag pushes stamp the tag as the release version. Branch pushes,
+          # pull requests and dispatches leave it empty, so those binaries
+          # report "devel" plus the commit the toolchain stamped.
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: bash scripts/package-release.sh "$TARGET"
       - uses: actions/upload-artifact@v6
         with:

@@ -23,15 +23,14 @@ import (
 	"github.com/ekarulf/quantumcat/internal/proxy"
 	"github.com/ekarulf/quantumcat/internal/transport"
 	"github.com/ekarulf/quantumcat/internal/tunnel"
+	"github.com/ekarulf/quantumcat/internal/version"
 	"github.com/tailscale/tailcat"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/wgengine/filter"
 )
 
-const usage = `Quantumcat — authenticated point-to-point networking
-
-qcat [--config DIR] identity init [--name NAME] [--provider software|secure-enclave]
+const usage = `qcat [--config DIR] identity init [--name NAME] [--provider software|secure-enclave]
 qcat [--config DIR] identity show
 qcat [--config DIR] peer add NAME FILE.qpeer
 qcat [--config DIR] peer list|show NAME|remove NAME
@@ -50,10 +49,17 @@ qcat [--config DIR] serve --tun [--export FILE.qpeer]
 qcat [--config DIR] status
 qcat [--config DIR] down [PEER|serve]
 qcat debug
+qcat version
 
 Pair identity show output out of band; serve --export includes public reachability.
 Flags for each command precede positional arguments. Ctrl-C closes the tunnel.
 `
+
+// help prefixes the usage text with the running build, so a bug report that
+// quotes --help output already says which binary produced it.
+func help() string {
+	return "Quantumcat " + version.Current().Short() + " — authenticated point-to-point networking\n\n" + usage
+}
 
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -74,20 +80,26 @@ func run(ctx context.Context, args []string) error {
 	dir := f.String("config", config.DefaultDir(), "configuration directory")
 	if err := f.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			fmt.Print(usage)
+			fmt.Print(help())
 			return nil
 		}
 		return err
 	}
 	args = f.Args()
 	if len(args) == 0 {
-		fmt.Print(usage)
+		fmt.Print(help())
 		return nil
 	}
 	s := config.Store{Dir: *dir}
 	switch args[0] {
 	case "help":
-		fmt.Print(usage)
+		fmt.Print(help())
+		return nil
+	case "version":
+		if len(args) != 1 {
+			return errors.New("version takes no arguments")
+		}
+		fmt.Print(version.Current())
 		return nil
 	case "identity":
 		return identity(ctx, s, args[1:])

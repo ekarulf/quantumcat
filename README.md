@@ -253,6 +253,15 @@ Requires Go 1.27.1 or newer.
 make build
 ```
 
+`qcat version` reports the build. Release archives from GitHub Releases name
+their tag; anything built from a checkout reports `devel` plus the commit hash,
+commit time, and whether the tree was modified, which the Go toolchain records
+automatically. To stamp a tag into a local build, set `VERSION`:
+
+```sh
+make build VERSION=v0.1.0
+```
+
 On supported Apple Silicon Macs:
 
 ```sh
