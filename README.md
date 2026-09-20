@@ -1,4 +1,10 @@
-# QuantumCat
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/logo-light.png">
+    <img src="docs/logo-light.png" alt="QuantumCat" width="720">
+  </picture>
+</p>
 
 **A small, post-quantum point-to-point VPN for connecting devices without a coordination server.**
 
