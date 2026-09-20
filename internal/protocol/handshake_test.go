@@ -33,12 +33,7 @@ func fixture(t *testing.T) (*Server, *Client, []byte, [32]byte, time.Time) {
 	rand.Read(remote.WG[:])
 	rand.Read(remote.Disco[:])
 	now := time.Now().Truncate(time.Second)
-	s := &Server{Identity: si, Public: sp, Keys: remote, Lookup: func(id PeerID) []byte {
-		if id == ID(cp) {
-			return cp
-		}
-		return nil
-	}}
+	s := &Server{Identity: si, Public: sp, Keys: remote, Authorized: func(yield func(PeerID, []byte) bool) { yield(ID(cp), cp) }}
 	c, hello, err := NewClient(ctx, ci, software.NewKEM, sp, local, remote, now)
 	if err != nil {
 		t.Fatal(err)
@@ -156,7 +151,7 @@ func TestFreshnessSourceRevocationAndExpiry(t *testing.T) {
 			case "source":
 				src[0] ^= 1
 			case "unknown":
-				s.Lookup = func(PeerID) []byte { return nil }
+				s.Authorized = func(func(PeerID, []byte) bool) {}
 			}
 			reply, session := s.Handle(ctx, src, hello, now)
 			if test == "stale" || test == "future" || test == "source" || test == "unknown" {
@@ -171,7 +166,7 @@ func TestFreshnessSourceRevocationAndExpiry(t *testing.T) {
 			}
 			switch test {
 			case "revoked":
-				s.Lookup = func(PeerID) []byte { return nil }
+				s.Authorized = func(func(PeerID, []byte) bool) {}
 			case "expired":
 				now = now.Add(31 * time.Second)
 			case "bad-finish":

@@ -281,8 +281,16 @@ QuantumCat is experimental. The implementation includes automated tests for auth
 
 Current `main` intentionally breaks compatibility with earlier builds: it uses
 Go's standard-library ML-DSA/ML-KEM implementations, SHA-384 bootstrap
-primitives, SHA-512/256 PeerIDs, and identity-file version 3. Reinitialize
+primitives, SHA-512/256 PeerIDs, identity-file version 3, and a nonce-blinded
+client peer tag in place of the transmitted client PeerID. Reinitialize
 identities and re-pair peers when upgrading.
+
+PeerIDs stay stable locally; they are simply no longer sent over the DERP
+bootstrap path, so a relay operator that does not already know a client's PeerID
+cannot use it to link separate client instances. An operator that *does* know a
+candidate PeerID can still recompute the tag and test it, and the client's source
+IP remains visible regardless. This is metadata hygiene, not anonymity — see
+[DESIGN.md](DESIGN.md) §22.8 for what it does and does not provide.
 
 Contributions, testing on real networks, protocol review, and security analysis are welcome.
 
