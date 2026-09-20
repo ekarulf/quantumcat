@@ -1,10 +1,11 @@
 # Quantumcat bootstrap v1
 
-This pre-release definition freezes PeerID at SHA-512/256 and makes the server
+This pre-release definition freezes PeerID at SHA-512/256, makes the server
 sign the canonical transcript bytes with pure ML-DSA-87 instead of their
-digest. The PeerID change is not identity-file- or pairing-compatible with
-earlier builds. The signature change is wire-incompatible but needs no
-additional re-pairing: identity keys and PeerIDs are unaffected.
+digest, and replaces the transmitted client PeerID with a nonce-blinded peer
+tag. The PeerID change is not identity-file- or pairing-compatible with
+earlier builds. The signature and blinding changes are wire-incompatible but
+need no additional re-pairing: identity keys and PeerIDs are unaffected.
 
 Network frames: ASCII `QCAT`, version byte `1`, message-type byte, big-endian
 uint16 payload length, payload. The header is eight bytes. Hard limit: 32768
@@ -13,7 +14,7 @@ bytes. All integers use big-endian encoding.
 
 | Type | Payload, in order | Bytes |
 | --- | --- | --- |
-| 1 ClientHello | client PeerID (32), WG public (32), disco public (32), nonce (32), server PeerID (32), reserved zeros (32), Unix timestamp (8), KEM public (1568), signature (4627) | 6395 |
+| 1 ClientHello | client peer tag (32), WG public (32), disco public (32), nonce (32), server PeerID (32), reserved zeros (32), Unix timestamp (8), KEM public (1568), signature (4627) | 6395 |
 | 2 ServerHello | server PeerID (32), WG public (32), disco public (32), nonce (32), ciphertext (1568), signature (4627), server proof (48) | 6371 |
 | 3 ClientFinish | transcript hash (48), client proof (48) | 96 |
 | 4 ServerAccepted | transcript hash (48), acknowledgement proof (48) | 96 |
@@ -26,6 +27,68 @@ PeerID is SHA-512/256 over `qcat-peer-v1` followed by that key. This derivation
 is frozen independently of the wire suite. Text IDs use `qpeer:` plus unpadded
 uppercase RFC 4648 base32. All 32 identifier bytes are retained.
 
+## Blinded client peer tag
+
+ClientHello does not transmit the client's PeerID. Its first 32-byte field is a
+per-handshake tag:
+
+```text
+client_peer_tag =
+    first 32 bytes of
+    HMAC-SHA-384(
+        key = client_nonce,
+        message =
+            "qcat-peer-tag-v1" ||
+            client_peer_id
+    )
+```
+
+The key is the 32 raw nonce bytes from the same ClientHello. The domain string
+is the 16 ASCII bytes `qcat-peer-tag-v1` with no length prefix, separator, or
+terminator; `client_peer_id` is the 32 raw PeerID bytes. Because every bootstrap
+and renewal draws a fresh nonce, the tag differs on every handshake.
+
+The tag is a wire pseudonym, not a credential. The nonce travels in the clear
+beside it, so anyone already holding a candidate PeerID or ML-DSA public key can
+recompute the tag and test it. Matching a tag only selects which public key the
+signature is checked against; ML-DSA-87 remains the sole client authenticator.
+
+The server resolves the tag by recomputing the expected tag for each authorized
+PeerID under the received nonce. Each individual comparison is constant time, but
+resolution as a whole is not: it returns on the first match, so its duration
+depends on where the match falls in the enumeration order. Implementations must
+not let that order be attacker-inferable — enumerating a Go map, whose iteration
+order is randomized per range, is acceptable; enumerating a fixed slice or
+on-disk order would leak the matched peer's position. The authorized set is held
+in memory; resolution performs no filesystem enumeration or parsing. A tag that
+resolves to no authorized identity is dropped.
+
+Everything after resolution uses the real PeerID: authorization, revocation,
+peer and renewal ownership, the per-identity rate limit, the replay key, the
+installed session identity, and configuration lookup. The tag is never stored as
+an identity.
+
+What the tag does and does not hide on the wire:
+
+* No stable long-lived client PQ identifier appears in ClientHello. An observer
+  with no candidate identity cannot link two client instances from their bootstrap
+  packets. An observer holding candidates can test each for one HMAC-SHA-384;
+  there is no key stretching, and the anonymity set is only as large as the set of
+  identities the observer cannot rule out.
+* Testing stays possible forever. A stored `(nonce, tag)` pair can be linked
+  retroactively once the PeerID is learned by any means, so archived captures are
+  not protected by blinding.
+* The relay also sees the client's source IP and port, which for most deployments
+  is a more stable cross-process identifier than the PeerID was. Blinding does
+  nothing about it.
+* The client WireGuard node key is the DERP routing identity and is reused for
+  every renewal, so all renewals within one running client are linkable
+  regardless of the tag. This is deliberate and unchanged.
+* Each new client process generates a fresh WireGuard node key, so blinding is
+  what removes the remaining protocol-level link across client lifetimes.
+* The server's PeerID and transport keys are still sent in the clear, and the
+  bootstrap is still trivially recognizable as Quantumcat. See DESIGN.md §22.8.
+
 The canonical transcript is this fixed **3483-byte** concatenation:
 
 ```text
@@ -34,7 +97,10 @@ server_peer_id || server_wg_public || server_disco_public ||
 server_nonce || kem_ciphertext || complete_unsigned_client_hello
 ```
 
-The complete unsigned ClientHello includes its timestamp and reserved bytes.
+The complete unsigned ClientHello includes its blinded peer tag, timestamp and
+reserved bytes, so the tag as transmitted is covered by both the client's
+ML-DSA signature and the server's transcript. Substituting a different tag, or
+reusing a signature made over other bytes in that field, fails verification.
 The transcript serves two distinct roles:
 
 * **ServerHello signs the canonical transcript bytes themselves** with pure
@@ -59,6 +125,8 @@ The DERP source must equal the signed client WG key. The client checks the
 server identity and transport keys against its paired descriptor. Timestamps
 allow ±120 seconds. Authenticated nonces enter a five-minute replay cache.
 Exact duplicate ClientHellos receive a cached response without re-encapsulation.
+The replay key stays `SHA-384(client_peer_id || client_nonce)` over the resolved
+real PeerID, not the blinded tag, so blinding does not widen the replay window.
 
 Pending state expires after 30 seconds, including acknowledgement retry state.
 Clients have a 25-second budget and retry once per second. ClientFinish includes
@@ -85,10 +153,37 @@ authenticated identity, shared across its source keys), 19,264 replay
 entries, 4096 entries in each separate source/identity rate table, and 4096
 installed sessions. The global budget is a resource bound, not a guarantee
 against distributed denial of service. Unknown peers trigger no signature work,
-encapsulation, filesystem I/O, or peer installation. Installed sessions expire
+encapsulation, or peer installation, and occupy no state beyond the single
+bounded per-source rate entry described below. They also trigger no filesystem
+I/O, though that is a requirement on the caller-supplied authorized set, which
+must be served from memory, rather than something the protocol layer enforces.
+
+ClientHello processing runs in this order: framing and exact-size checks, the
+cheap field checks above, the timestamp window, the per-source bucket, blinded
+tag resolution, the shared verification budget, replay and capacity checks,
+ML-DSA verification, then the per-PeerID bucket and encapsulation. Resolution
+costs one HMAC-SHA-384 per authorized peer over 48 bytes, so it is far cheaper
+than the ML-DSA verification it gates, and the per-source bucket caps how often
+an unauthenticated sender can trigger it. Because resolution precedes the shared
+budget, an unresolvable tag cannot consume verification capacity. Because the
+per-PeerID bucket follows verification, constructing another peer's tag cannot
+spend that peer's authenticated quota. A well-formed hello from an unknown
+source does now occupy one bounded per-source rate entry before its tag is
+resolved; that table is still capped at 4096 with oldest-first eviction, and the
+threat model already assumes attackers know authorized PeerIDs.
+
+Enumeration also makes two authenticated paths linear in the size of the
+authorized set: ClientFinish re-checks the resolved PeerID against it, and each
+installed session's validity callback re-checks it once per second to honour
+revocation. Both are cheap for the small paired sets this protocol targets, but
+neither is O(1).
+
+Installed sessions expire
 after one hour. Revocation is checked before key confirmation and during use.
 CLI clients renew every 45 minutes with a fresh nonce and ephemeral ML-KEM key,
-using the same WireGuard node/discovery keys. The server permits replacement of
+using the same WireGuard node/discovery keys. The fresh nonce necessarily changes
+the blinded peer tag on every renewal, while the reused WireGuard key keeps
+renewals linkable for that client's lifetime. The server permits replacement of
 an active node's PSK and lease only for the same authenticated PQ identity and
 discovery key. Duplicate finishes only resend their acknowledgement; they never
 extend a lease or reinstall an older PSK. Revoked identities cannot renew.

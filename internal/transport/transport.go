@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"iter"
 	"time"
 
 	"github.com/ekarulf/quantumcat/internal/crypto/provider"
@@ -23,12 +24,12 @@ func Keys(node key.NodePrivate) protocol.Keys {
 	disco := tailcat.DiscoPublicForNode(node).Raw32()
 	return protocol.Keys{WG: wg, Disco: disco}
 }
-func Server(identity provider.Identity, pub []byte, node key.NodePrivate, lookup func(protocol.PeerID) []byte) *tailcat.Server {
-	return serverWithLifetime(identity, pub, node, lookup, SessionLifetime)
+func Server(identity provider.Identity, pub []byte, node key.NodePrivate, authorized iter.Seq2[protocol.PeerID, []byte]) *tailcat.Server {
+	return serverWithLifetime(identity, pub, node, authorized, SessionLifetime)
 }
 
-func serverWithLifetime(identity provider.Identity, pub []byte, node key.NodePrivate, lookup func(protocol.PeerID) []byte, lifetime time.Duration) *tailcat.Server {
-	p := &protocol.Server{Identity: identity, Public: pub, Keys: Keys(node), Lookup: lookup}
+func serverWithLifetime(identity provider.Identity, pub []byte, node key.NodePrivate, authorized iter.Seq2[protocol.PeerID, []byte], lifetime time.Duration) *tailcat.Server {
+	p := &protocol.Server{Identity: identity, Public: pub, Keys: Keys(node), Authorized: authorized}
 	return &tailcat.Server{
 		BootstrapCleanup:    func() { p.Expire(time.Now()) },
 		BootstrapClose:      p.Close,
@@ -43,9 +44,11 @@ func serverWithLifetime(identity provider.Identity, pub []byte, node key.NodePri
 			}
 			peer := &tailcat.AuthenticatedPeer{Identity: [32]byte(session.Peer), Disco: key.DiscoPublicFromRaw32(mem.B(session.Keys.Disco[:])), PSK: tailcat.PresharedKey(session.PSK), Installed: session.Installed}
 			id := session.Peer
-			pinned := append([]byte(nil), lookup(id)...)
+			pinned := append([]byte(nil), protocol.Lookup(authorized, id)...)
 			expires := time.Now().Add(lifetime)
-			peer.Valid = func() bool { return time.Now().Before(expires) && len(pinned) > 0 && bytes.Equal(lookup(id), pinned) }
+			peer.Valid = func() bool {
+				return time.Now().Before(expires) && len(pinned) > 0 && bytes.Equal(protocol.Lookup(authorized, id), pinned)
+			}
 			clear(session.PSK[:])
 			return reply, peer
 		},

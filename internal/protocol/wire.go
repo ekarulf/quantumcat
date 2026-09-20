@@ -2,12 +2,14 @@
 package protocol
 
 import (
+	"crypto/hmac"
 	"crypto/mldsa"
 	"crypto/mlkem"
 	"crypto/sha512"
 	"encoding/base32"
 	"encoding/binary"
 	"errors"
+	"iter"
 	"strings"
 )
 
@@ -26,6 +28,7 @@ const (
 	ClientContext    = "qcat-handshake-client-v1"
 	ServerContext    = "qcat-handshake-server-v1"
 	peerIDDomain     = "qcat-peer-v1" // Frozen independently of Version.
+	peerTagDomain    = "qcat-peer-tag-v1"
 	transcriptDomain = "qcat-transcript-v1"
 )
 
@@ -45,6 +48,38 @@ func ParseID(s string) (PeerID, error) {
 	}
 	copy(p[:], b)
 	return p, nil
+}
+
+// peerTag blinds a stable PeerID for transmission. ClientHello carries this tag
+// instead of the PeerID itself so that a DERP operator cannot read a long-lived
+// pseudonymous identifier off the bootstrap path; the fresh per-handshake nonce
+// keys the HMAC, so separate client instances present unrelated tags.
+//
+// The tag is a wire pseudonym, never a credential. The nonce travels in the
+// clear beside it, so anyone already holding a candidate PeerID or ML-DSA public
+// key can recompute a tag and test it. ML-DSA-87 remains the only client
+// authenticator.
+func peerTag(id PeerID, nonce []byte) [32]byte {
+	m := hmac.New(sha512.New384, nonce)
+	m.Write([]byte(peerTagDomain))
+	m.Write(id[:])
+	return [32]byte(m.Sum(nil)[:32])
+}
+
+// Lookup returns the ML-DSA public key authorized for id, or nil when id is
+// unknown or revoked. Blinded tags already require the server to enumerate its
+// authorized peers, so enumeration is the single authorization interface and no
+// separate lookup callback can drift from it.
+func Lookup(peers iter.Seq2[PeerID, []byte], id PeerID) []byte {
+	if peers == nil {
+		return nil
+	}
+	for candidate, pub := range peers {
+		if candidate == id {
+			return pub
+		}
+	}
+	return nil
 }
 
 type Keys struct{ WG, Disco [32]byte }

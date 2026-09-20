@@ -10,6 +10,7 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"errors"
+	"iter"
 	"sync"
 	"time"
 
@@ -77,7 +78,10 @@ func NewClient(ctx context.Context, identity provider.Identity, newKEM provider.
 	}
 	stamp := make([]byte, 8)
 	binary.BigEndian.PutUint64(stamp, uint64(now.Unix()))
-	hello := join(id[:], local.WG[:], local.Disco[:], nonce, sid[:], make([]byte, 32), stamp, kp)
+	// Send a nonce-blinded tag rather than the stable PeerID. The signature below
+	// still covers the tag, so the server's transcript binds whatever was sent.
+	tag := peerTag(id, nonce)
+	hello := join(tag[:], local.WG[:], local.Disco[:], nonce, sid[:], make([]byte, 32), stamp, kp)
 	sig, err := identity.Sign(ctx, ClientContext, frame(ClientHello, hello))
 	if err != nil {
 		return fail(err)
@@ -150,8 +154,11 @@ type Server struct {
 	Identity provider.Identity
 	Public   []byte
 	Keys     Keys
-	// Lookup must use the full PeerID and return nil for revoked/unknown peers.
-	Lookup     func(PeerID) []byte
+	// Authorized enumerates each authorized peer's full PeerID and ML-DSA public
+	// key. It must be served from memory and must omit revoked peers: handshake
+	// processing performs no filesystem enumeration or parsing. Protocol code
+	// only reads the set; it never retains or mutates it.
+	Authorized iter.Seq2[PeerID, []byte]
 	pending    map[[hashSize]byte]*pending
 	replay     map[[hashSize]byte]time.Time
 	limits     map[[32]byte]bucket
@@ -241,7 +248,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	if kind == ClientFinish {
 		h := [hashSize]byte(b[:hashSize])
 		p := s.pending[h]
-		if p == nil || p.source != source || len(s.Lookup(p.session.Peer)) == 0 || !hmac.Equal(proof(p.hk, "client-finished", h), b[hashSize:]) {
+		if p == nil || p.source != source || len(Lookup(s.Authorized, p.session.Peer)) == 0 || !hmac.Equal(proof(p.hk, "client-finished", h), b[hashSize:]) {
 			return nil, nil
 		}
 		ack := frame(ServerAccepted, join(h[:], proof(p.hk, "server-accepted", h)))
@@ -290,11 +297,9 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	if kind != ClientHello {
 		return nil, nil
 	}
-	id := PeerID(b[:32])
-	pub := s.Lookup(id)
 	// Version 1 assigns no semantics to the reserved bytes. The complete hello
 	// is transcript-bound, but non-zero extensions still require a new version.
-	if len(pub) == 0 || ID(pub) != id || source != [32]byte(b[32:64]) || [32]byte(b[64:96]) == [32]byte{} || PeerID(b[128:160]) != ID(s.Public) || [32]byte(b[160:192]) != [32]byte{} {
+	if source != [32]byte(b[32:64]) || [32]byte(b[64:96]) == [32]byte{} || PeerID(b[128:160]) != ID(s.Public) || [32]byte(b[160:192]) != [32]byte{} {
 		return nil, nil
 	}
 	stamp := int64(binary.BigEndian.Uint64(b[192:200]))
@@ -309,10 +314,20 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	if _, exists := s.limits[source]; !exists && len(s.limits) >= 4096 {
 		evictOldest(s.limits)
 	}
-	// Charge a sender's quota before the shared verification budget. Claimed
-	// identities must not consume another device's quota before authentication.
+	// Charge a sender's quota before the identity scan and the shared
+	// verification budget. Claimed identities must not consume another device's
+	// quota before authentication.
 	s.limits[source], ok = allow(s.limits[source], now, 4)
 	if !ok {
+		return nil, nil
+	}
+	// The first 32 bytes are a nonce-blinded tag, not the client's PeerID, so
+	// recover the real identity by recomputing each authorized peer's tag. One
+	// HMAC per authorized peer is far cheaper than the ML-DSA verification it
+	// gates, and the source bucket above bounds how often an unauthenticated
+	// sender can trigger the scan. Everything downstream uses the real PeerID.
+	id, pub := s.resolve(b[:32], b[96:128])
+	if len(pub) == 0 || ID(pub) != id {
 		return nil, nil
 	}
 	s.global, ok = allow(s.global, now, 64)
@@ -386,6 +401,22 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	s.pending[hash] = &pending{session: Session{Peer: id, Keys: Keys{[32]byte(b[32:64]), [32]byte(b[64:96])}, PSK: psk}, hash: hash, hk: hk, source: source, expires: now.Add(30 * time.Second), helloHash: sha512.Sum384(packet), response: response}
 	s.replay[replay] = now.Add(5 * time.Minute)
 	return response, nil
+}
+
+// resolve maps a blinded client peer tag back to the authorized identity that
+// produced it, returning the zero PeerID and nil when nothing matches. Matching
+// a tag proves nothing on its own: it only selects which ML-DSA public key the
+// signature must verify against.
+func (s *Server) resolve(tag, nonce []byte) (PeerID, []byte) {
+	if s.Authorized == nil {
+		return PeerID{}, nil
+	}
+	for id, pub := range s.Authorized {
+		if candidate := peerTag(id, nonce); hmac.Equal(candidate[:], tag) {
+			return id, pub
+		}
+	}
+	return PeerID{}, nil
 }
 
 func evictOldest(table map[[32]byte]bucket) {
