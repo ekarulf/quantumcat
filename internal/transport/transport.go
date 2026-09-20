@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"iter"
+	"sync"
 	"time"
 
 	"github.com/ekarulf/quantumcat/internal/crypto/provider"
@@ -65,22 +66,49 @@ func Client(identity provider.Identity, newKEM provider.NewKEM, pub []byte, endp
 	node := key.NewNode()
 	c := tailcat.NewClient(endpoint)
 	c.Key = node
+	// State advances only after ServerAccepted. Retaining a finished handshake
+	// across a caller timeout lets a later Renew retry its exact ClientFinish
+	// instead of accidentally proposing an old parent after the server has
+	// already committed the new ratchet state.
+	var state protocol.State
+	var pending *protocol.Client
+	var pendingPacket []byte
+	var pendingPSK [32]byte
+	var stateMu sync.Mutex
 	c.Bootstrap = func(ctx context.Context, send func([]byte) error, recv <-chan []byte) (tailcat.PresharedKey, error) {
 		ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 		defer cancel()
 		remote := protocol.Keys{WG: ci.ServerPublic.Raw32(), Disco: ci.ServerDiscoPublic.Raw32()}
-		handshake, hello, err := protocol.NewClient(ctx, identity, newKEM, pub, Keys(node), remote, time.Now())
-		if err != nil {
-			return tailcat.PresharedKey{}, err
+		stateMu.Lock()
+		handshake := pending
+		packet := append([]byte(nil), pendingPacket...)
+		psk := pendingPSK
+		stateMu.Unlock()
+		finishing := handshake != nil
+		if !finishing {
+			var hello []byte
+			var err error
+			stateMu.Lock()
+			parent := state
+			stateMu.Unlock()
+			handshake, hello, err = protocol.NewClientWithState(ctx, identity, newKEM, pub, Keys(node), remote, parent, time.Now())
+			if err != nil {
+				return tailcat.PresharedKey{}, err
+			}
+			packet = hello
 		}
-		defer handshake.Close()
+		// A fresh attempt that never reaches ClientFinish owns an ephemeral KEM
+		// key. A completed attempt is retained so a later caller can retry its
+		// authenticated finish without losing ratchet synchronization.
+		defer func() {
+			if !finishing {
+				handshake.Close()
+			}
+		}()
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
-		packet := hello
-		var psk [32]byte
 		defer clear(psk[:])
-		finishing := false
-		if err = send(packet); err != nil {
+		if err := send(packet); err != nil {
 			return tailcat.PresharedKey{}, err
 		}
 		for {
@@ -88,24 +116,36 @@ func Client(identity provider.Identity, newKEM provider.NewKEM, pub []byte, endp
 			case <-ctx.Done():
 				return tailcat.PresharedKey{}, ctx.Err()
 			case <-ticker.C:
-				if err = send(packet); err != nil {
+				if err := send(packet); err != nil {
 					return tailcat.PresharedKey{}, err
 				}
 			case reply := <-recv:
 				if finishing {
 					if handshake.Accepted(reply) {
+						stateMu.Lock()
+						state = handshake.State()
+						if pending == handshake {
+							pending, pendingPacket = nil, nil
+							clear(pendingPSK[:])
+						}
+						stateMu.Unlock()
+						handshake.Close()
 						return tailcat.PresharedKey(psk), nil
 					}
 					continue
 				}
 				var finish []byte
+				var err error
 				psk, finish, err = handshake.Complete(ctx, reply)
 				if err != nil {
 					continue
 				}
 				packet = finish
 				finishing = true
-				if err = send(packet); err != nil {
+				stateMu.Lock()
+				pending, pendingPacket, pendingPSK = handshake, append([]byte(nil), finish...), psk
+				stateMu.Unlock()
+				if err := send(packet); err != nil {
 					return tailcat.PresharedKey{}, err
 				}
 			}

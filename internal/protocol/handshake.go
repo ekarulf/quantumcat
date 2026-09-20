@@ -19,20 +19,56 @@ import (
 
 var ErrRejected = errors.New("handshake rejected")
 
-func derive(ss []byte, hash [hashSize]byte) (psk, confirmation [32]byte, err error) {
-	p, err := hkdf.Expand(sha512.New384, ss, "qcat-wireguard-psk-v2"+string(hash[:]), 32)
+// State is the private ratchet state for one client WireGuard identity. It is
+// never serialized or sent on the wire. The zero value represents the initial
+// bootstrap; every committed handshake produces a valid state with its own
+// root secret, transcript hash, and epoch.
+type State struct {
+	Epoch      uint64
+	Transcript [hashSize]byte
+	Root       [hashSize]byte
+	valid      bool
+}
+
+func (s State) nextEpoch() uint64 {
+	if !s.valid {
+		return 0
+	}
+	return s.Epoch + 1
+}
+
+// derive advances the sparse PQ ratchet. The HMAC is HKDF-Extract with the
+// previous root as salt. Fresh ML-KEM entropy is always injected; the parent
+// and new transcript hashes plus epoch bind that entropy to this exact edge of
+// the ratchet rather than merely to a fresh but interchangeable handshake.
+func derive(parent State, ss []byte, hash [hashSize]byte) (next State, psk, confirmation [32]byte, err error) {
+	epoch := parent.nextEpoch()
+	m := hmac.New(sha512.New384, parent.Root[:])
+	m.Write([]byte(rootDomain))
+	m.Write(ss)
+	m.Write(parent.Transcript[:])
+	m.Write(hash[:])
+	var sequence [8]byte
+	binary.BigEndian.PutUint64(sequence[:], epoch)
+	m.Write(sequence[:])
+	copy(next.Root[:], m.Sum(nil))
+	clear(sequence[:])
+	next.Epoch, next.Transcript, next.valid = epoch, hash, true
+	p, err := hkdf.Expand(sha512.New384, next.Root[:], "qcat-wireguard-psk-v3"+string(hash[:]), 32)
 	if err != nil {
-		return psk, confirmation, err
+		clear(next.Root[:])
+		return State{}, psk, confirmation, err
 	}
 	defer clear(p)
-	c, err := hkdf.Expand(sha512.New384, ss, "qcat-handshake-confirm-v2"+string(hash[:]), 32)
+	c, err := hkdf.Expand(sha512.New384, next.Root[:], "qcat-handshake-confirm-v3"+string(hash[:]), 32)
 	if err != nil {
-		return psk, confirmation, err
+		clear(next.Root[:])
+		return State{}, psk, confirmation, err
 	}
 	defer clear(c)
 	copy(psk[:], p)
 	copy(confirmation[:], c)
-	return psk, confirmation, nil
+	return next, psk, confirmation, nil
 }
 func proof(k [32]byte, label string, hash [hashSize]byte) []byte {
 	m := hmac.New(sha512.New384, k[:])
@@ -49,9 +85,20 @@ type Client struct {
 	serverPublic []byte
 	keys         Keys
 	ack          []byte
+	parent       State
+	next         State
+	accepted     bool
 }
 
 func NewClient(ctx context.Context, identity provider.Identity, newKEM provider.NewKEM, serverPublic []byte, local, remote Keys, now time.Time) (*Client, []byte, error) {
+	return NewClientWithState(ctx, identity, newKEM, serverPublic, local, remote, State{}, now)
+}
+
+// NewClientWithState starts either the initial bootstrap (zero state) or the
+// next authenticated ratchet step. Callers must retain State only after
+// Accepted succeeds; speculative ServerHello processing must not advance the
+// caller's committed state.
+func NewClientWithState(ctx context.Context, identity provider.Identity, newKEM provider.NewKEM, serverPublic []byte, local, remote Keys, parent State, now time.Time) (*Client, []byte, error) {
 	if len(serverPublic) != mldsa.MLDSA87PublicKeySize {
 		return nil, nil, ErrRejected
 	}
@@ -81,15 +128,22 @@ func NewClient(ctx context.Context, identity provider.Identity, newKEM provider.
 	// Send a nonce-blinded tag rather than the stable PeerID. The signature below
 	// still covers the tag, so the server's transcript binds whatever was sent.
 	tag := peerTag(id, nonce)
-	hello := join(tag[:], local.WG[:], local.Disco[:], nonce, sid[:], make([]byte, 32), stamp, kp)
+	parentEpoch := make([]byte, 8)
+	binary.BigEndian.PutUint64(parentEpoch, parent.nextEpoch())
+	hello := join(tag[:], local.WG[:], local.Disco[:], nonce, sid[:], parent.Transcript[:], parentEpoch, stamp, kp)
+	clear(parentEpoch)
 	sig, err := identity.Sign(ctx, ClientContext, frame(ClientHello, hello))
 	if err != nil {
 		return fail(err)
 	}
-	c := &Client{identity: identity, kem: kem, hello: hello, server: sid, serverPublic: append([]byte(nil), serverPublic...), keys: remote}
+	c := &Client{identity: identity, kem: kem, hello: hello, server: sid, serverPublic: append([]byte(nil), serverPublic...), keys: remote, parent: parent}
 	return c, frame(ClientHello, join(hello, sig)), nil
 }
-func (c *Client) Close() { c.kem.Destroy() }
+func (c *Client) Close() {
+	c.kem.Destroy()
+	clear(c.parent.Root[:])
+	clear(c.next.Root[:])
+}
 func (c *Client) Complete(ctx context.Context, packet []byte) ([32]byte, []byte, error) {
 	var zero [32]byte
 	kind, b, err := Parse(packet)
@@ -110,7 +164,7 @@ func (c *Client) Complete(ctx context.Context, packet []byte) ([32]byte, []byte,
 		return zero, nil, err
 	}
 	defer clear(ss)
-	psk, hk, err := derive(ss, hash)
+	next, psk, hk, err := derive(c.parent, ss, hash)
 	if err != nil {
 		return zero, nil, err
 	}
@@ -121,10 +175,24 @@ func (c *Client) Complete(ctx context.Context, packet []byte) ([32]byte, []byte,
 		return zero, nil, ErrRejected
 	}
 	c.kem.Destroy()
+	c.next = next
 	c.ack = frame(ServerAccepted, join(hash[:], proof(hk, "server-accepted", hash)))
 	return psk, frame(ClientFinish, join(hash[:], proof(hk, "client-finished", hash))), nil
 }
-func (c *Client) Accepted(packet []byte) bool { return len(c.ack) > 0 && hmac.Equal(c.ack, packet) }
+func (c *Client) Accepted(packet []byte) bool {
+	c.accepted = len(c.ack) > 0 && hmac.Equal(c.ack, packet)
+	return c.accepted
+}
+
+// State returns the candidate state only after the server's authenticated
+// acknowledgement was accepted. A zero result means this Client has not
+// completed and committed a handshake.
+func (c *Client) State() State {
+	if !c.accepted {
+		return State{}
+	}
+	return c.next
+}
 
 type Session struct {
 	Peer PeerID
@@ -136,6 +204,7 @@ type Session struct {
 }
 type pending struct {
 	session    Session
+	state      State
 	hash       [hashSize]byte
 	hk         [32]byte
 	source     [32]byte
@@ -144,6 +213,11 @@ type pending struct {
 	installing bool
 	helloHash  [hashSize]byte
 	response   []byte
+}
+type committed struct {
+	peer  PeerID
+	keys  Keys
+	state State
 }
 type bucket struct {
 	start  time.Time
@@ -160,6 +234,7 @@ type Server struct {
 	// only reads the set; it never retains or mutates it.
 	Authorized iter.Seq2[PeerID, []byte]
 	pending    map[[hashSize]byte]*pending
+	committed  map[[32]byte]committed
 	replay     map[[hashSize]byte]time.Time
 	limits     map[[32]byte]bucket
 	peerLimits map[[32]byte]bucket
@@ -174,6 +249,7 @@ func (s *Server) Expire(now time.Time) {
 		if !now.Before(p.expires) {
 			clear(p.hk[:])
 			clear(p.session.PSK[:])
+			clear(p.state.Root[:])
 			delete(s.pending, h)
 		}
 	}
@@ -196,7 +272,12 @@ func (s *Server) Close() {
 	for h, p := range s.pending {
 		clear(p.hk[:])
 		clear(p.session.PSK[:])
+		clear(p.state.Root[:])
 		delete(s.pending, h)
+	}
+	for source, state := range s.committed {
+		clear(state.state.Root[:])
+		delete(s.committed, source)
 	}
 	clear(s.replay)
 	clear(s.limits)
@@ -217,6 +298,22 @@ func allow(b bucket, now time.Time, max int) (bucket, bool) {
 	return b, true
 }
 
+// parent returns the one ratchet state that may advance for this transport
+// identity. A previously unseen node can only bootstrap epoch zero with an all
+// zero parent hash. Once installed, every renewal must name the last committed
+// transcript and the immediately following epoch. The comparison happens only
+// after ML-DSA authentication, so unauthenticated packets cannot probe state.
+func (s *Server) parent(source [32]byte, peer PeerID, keys Keys, epoch uint64, previous [hashSize]byte) (State, bool) {
+	current, ok := s.committed[source]
+	if !ok {
+		return State{}, epoch == 0 && previous == [hashSize]byte{}
+	}
+	if current.peer != peer || current.keys != keys || !current.state.valid || current.state.Epoch == ^uint64(0) {
+		return State{}, false
+	}
+	return current.state, epoch == current.state.Epoch+1 && hmac.Equal(previous[:], current.state.Transcript[:])
+}
+
 // Handle is serialized and bounds all caches. No work or state is allocated for
 // unknown identities, and encapsulation follows authentication and replay checks.
 func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now time.Time) ([]byte, *Session) {
@@ -230,6 +327,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		if !now.Before(p.expires) {
 			clear(p.hk[:])
 			clear(p.session.PSK[:])
+			clear(p.state.Root[:])
 			delete(s.pending, h)
 		}
 	}
@@ -270,6 +368,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 			if other != p && other.source == source {
 				clear(other.hk[:])
 				clear(other.session.PSK[:])
+				clear(other.state.Root[:])
 				delete(s.pending, key)
 			}
 		}
@@ -286,8 +385,21 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 				clear(p.session.PSK[:])
 				if ok {
 					p.accepted = true
+					if s.committed == nil {
+						s.committed = make(map[[32]byte]committed)
+					}
+					old, replaced := s.committed[p.source]
+					if replaced {
+						clear(old.state.Root[:])
+					}
+					s.committed[p.source] = committed{peer: p.session.Peer, keys: p.session.Keys, state: p.state}
+					clear(p.state.Root[:])
+					// Keep only the confirmation key long enough for a client that
+					// lost ServerAccepted to resume its exact ClientFinish retry.
+					p.expires = time.Now().Add(5 * time.Minute)
 				} else {
 					clear(p.hk[:])
+					clear(p.state.Root[:])
 					delete(s.pending, h)
 				}
 			})
@@ -297,12 +409,10 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	if kind != ClientHello {
 		return nil, nil
 	}
-	// Version 1 assigns no semantics to the reserved bytes. The complete hello
-	// is transcript-bound, but non-zero extensions still require a new version.
-	if source != [32]byte(b[32:64]) || [32]byte(b[64:96]) == [32]byte{} || PeerID(b[128:160]) != ID(s.Public) || [32]byte(b[160:192]) != [32]byte{} {
+	if source != [32]byte(b[clientWGOffset:clientWGOffset+32]) || [32]byte(b[clientDiscoOffset:clientDiscoOffset+32]) == [32]byte{} || PeerID(b[serverIDOffset:serverIDOffset+32]) != ID(s.Public) {
 		return nil, nil
 	}
-	stamp := int64(binary.BigEndian.Uint64(b[192:200]))
+	stamp := int64(binary.BigEndian.Uint64(b[timestampOffset : timestampOffset+8]))
 	if stamp < now.Unix()-120 || stamp > now.Unix()+120 {
 		return nil, nil
 	}
@@ -326,7 +436,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	// HMAC per authorized peer is far cheaper than the ML-DSA verification it
 	// gates, and the source bucket above bounds how often an unauthenticated
 	// sender can trigger the scan. Everything downstream uses the real PeerID.
-	id, pub := s.resolve(b[:32], b[96:128])
+	id, pub := s.resolve(b[peerTagOffset:peerTagOffset+32], b[nonceOffset:nonceOffset+32])
 	if len(pub) == 0 || ID(pub) != id {
 		return nil, nil
 	}
@@ -334,7 +444,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	if !ok {
 		return nil, nil
 	}
-	replay := sha512.Sum384(join(id[:], b[96:128]))
+	replay := sha512.Sum384(join(id[:], b[nonceOffset:nonceOffset+32]))
 	if _, ok := s.replay[replay]; ok {
 		digest := sha512.Sum384(packet)
 		for _, p := range s.pending {
@@ -353,6 +463,13 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	if !verify(pub, ClientContext, frame(ClientHello, hello), b[helloSize:]) {
 		return nil, nil
 	}
+	keys := Keys{WG: [32]byte(b[clientWGOffset : clientWGOffset+32]), Disco: [32]byte(b[clientDiscoOffset : clientDiscoOffset+32])}
+	previous := [hashSize]byte(b[parentHashOffset : parentHashOffset+hashSize])
+	epoch := binary.BigEndian.Uint64(b[epochOffset : epochOffset+8])
+	parent, ok := s.parent(source, id, keys, epoch, previous)
+	if !ok {
+		return nil, nil
+	}
 	if _, exists := s.peerLimits[[32]byte(id)]; !exists && len(s.peerLimits) >= 4096 {
 		evictOldest(s.peerLimits)
 	}
@@ -369,7 +486,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	if owned >= 8 {
 		return nil, nil
 	}
-	kp, err := mlkem.NewEncapsulationKey1024(hello[200:])
+	kp, err := mlkem.NewEncapsulationKey1024(hello[kemOffset:])
 	if err != nil {
 		return nil, nil
 	}
@@ -381,7 +498,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	}
 	sid := ID(s.Public)
 	tb, hash := transcript(hello, sid, s.Keys, nonce, ct)
-	psk, hk, err := derive(ss, hash)
+	next, psk, hk, err := derive(parent, ss, hash)
 	if err != nil {
 		return nil, nil
 	}
@@ -395,10 +512,15 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	}
 	if s.pending == nil {
 		s.pending = make(map[[hashSize]byte]*pending)
+	}
+	if s.replay == nil {
 		s.replay = make(map[[hashSize]byte]time.Time)
 	}
+	if s.committed == nil {
+		s.committed = make(map[[32]byte]committed)
+	}
 	response := frame(ServerHello, join(sid[:], s.Keys.WG[:], s.Keys.Disco[:], nonce, ct, sig, proof(hk, "server-finished", hash)))
-	s.pending[hash] = &pending{session: Session{Peer: id, Keys: Keys{[32]byte(b[32:64]), [32]byte(b[64:96])}, PSK: psk}, hash: hash, hk: hk, source: source, expires: now.Add(30 * time.Second), helloHash: sha512.Sum384(packet), response: response}
+	s.pending[hash] = &pending{session: Session{Peer: id, Keys: keys, PSK: psk}, state: next, hash: hash, hk: hk, source: source, expires: now.Add(30 * time.Second), helloHash: sha512.Sum384(packet), response: response}
 	s.replay[replay] = now.Add(5 * time.Minute)
 	return response, nil
 }

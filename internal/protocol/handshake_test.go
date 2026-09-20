@@ -6,7 +6,7 @@ import (
 	"crypto/mlkem"
 	"crypto/rand"
 	"crypto/sha512"
-	"encoding/hex"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -229,14 +229,14 @@ func TestValidFrame(t *testing.T) {
 	}
 }
 
-func TestVersionOneSHA384Sizes(t *testing.T) {
-	if Version != 1 || hashSize != sha512.Size384 || proofSize != sha512.Size384 {
+func TestVersionTwoSHA384Sizes(t *testing.T) {
+	if Version != 2 || hashSize != sha512.Size384 || proofSize != sha512.Size384 {
 		t.Fatalf("unexpected suite constants: version=%d hash=%d proof=%d", Version, hashSize, proofSize)
 	}
 	if serverSize != 6371 || hashSize+proofSize != 96 {
 		t.Fatalf("unexpected payload sizes: server=%d finish=%d", serverSize, hashSize+proofSize)
 	}
-	if transcriptSize != 3483 || transcriptSize <= hashSize {
+	if helloSize != 1792 || transcriptSize != 3507 || transcriptSize <= hashSize {
 		t.Fatalf("unexpected transcript size: %d", transcriptSize)
 	}
 }
@@ -340,15 +340,54 @@ func TestDeriveKnownAnswer(t *testing.T) {
 	for i := range hash {
 		hash[i] = byte(0x80 + i)
 	}
-	psk, confirmation, err := derive(ss, hash)
+	next, psk, confirmation, err := derive(State{}, ss, hash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := hex.EncodeToString(psk[:]), "4382598d92933ba95a56715c284157d77f3f9b99dff5a654c74455670421d02d"; got != want {
-		t.Fatalf("PSK = %s, want %s", got, want)
+	if !next.valid || next.Epoch != 0 || next.Transcript != hash || next.Root == [hashSize]byte{} {
+		t.Fatal("initial root state was not derived")
 	}
-	if got, want := hex.EncodeToString(confirmation[:]), "376e3da389d23edb393e42bde1abedebae3b87dd86439fb85ebbdb9c3c8abd02"; got != want {
-		t.Fatalf("confirmation = %s, want %s", got, want)
+	if psk == [32]byte{} || confirmation == [32]byte{} || psk == confirmation {
+		t.Fatal("derived traffic and confirmation keys are not independently usable")
+	}
+}
+
+func TestRenewalRatchetBindsParentAndEpoch(t *testing.T) {
+	s, first, hello, src, now := fixture(t)
+	ctx := context.Background()
+	reply, _ := s.Handle(ctx, src, hello, now)
+	_, finish, err := first.Complete(ctx, reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, installed := s.Handle(ctx, src, finish, now)
+	if installed == nil || !first.Accepted(ack) {
+		t.Fatal("initial handshake did not commit")
+	}
+	installed.Installed(true)
+
+	// A renewal carrying the committed state advances the ratchet exactly once.
+	renewal, renewedHello, err := NewClientWithState(ctx, first.identity, software.NewKEM, first.serverPublic, Keys{WG: src, Disco: [32]byte{1}}, first.keys, first.State(), now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer renewal.Close()
+	if got := binary.BigEndian.Uint64(renewedHello[8+epochOffset : 8+epochOffset+8]); got != 1 {
+		t.Fatalf("renewal epoch=%d, want 1", got)
+	}
+	if reply, session := s.Handle(ctx, src, renewedHello, now.Add(time.Second)); len(reply) == 0 || session != nil {
+		t.Fatal("valid renewal rejected")
+	}
+
+	// A zero-state client cannot reset the same node to epoch zero, and a valid
+	// state cannot skip directly to a different parent transcript.
+	stale, staleHello, err := NewClient(ctx, first.identity, software.NewKEM, first.serverPublic, Keys{WG: src, Disco: [32]byte{1}}, first.keys, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stale.Close()
+	if reply, session := s.Handle(ctx, src, staleHello, now.Add(2*time.Second)); reply != nil || session != nil {
+		t.Fatal("stale epoch zero accepted after commitment")
 	}
 }
 

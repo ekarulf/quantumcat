@@ -62,17 +62,17 @@ func TestClientHelloOmitsRawPeerID(t *testing.T) {
 	}
 }
 
-// Blinding must not change the payload sizes frozen by version 1.
+// Version 2 extends the signed hello with its ratchet parent and epoch.
 func TestBlindingDoesNotChangeWireSize(t *testing.T) {
 	_, _, hello, _, _ := fixture(t)
-	if helloSize != 32*6+8+1568 {
-		t.Fatalf("unsigned hello = %d bytes, want %d", helloSize, 32*6+8+1568)
+	if helloSize != 32*5+hashSize+8+8+1568 {
+		t.Fatalf("unsigned hello = %d bytes, want %d", helloSize, 32*5+hashSize+8+8+1568)
 	}
 	if got, want := len(hello), 8+helloSize+mldsa.MLDSA87SignatureSize; got != want {
 		t.Fatalf("ClientHello frame = %d bytes, want %d", got, want)
 	}
-	if len(hello) != 8+6395 {
-		t.Fatalf("ClientHello payload = %d bytes, want 6395", len(hello)-8)
+	if len(hello) != 8+6419 {
+		t.Fatalf("ClientHello payload = %d bytes, want 6419", len(hello)-8)
 	}
 }
 
@@ -354,12 +354,12 @@ func TestMutatedHelloFieldsFailWithoutResigning(t *testing.T) {
 		// catch them.
 		"wg-public": {offset: 32, verified: true},
 		"disco":     {offset: 64, verified: true},
-		"kem":       {offset: 200, verified: true},
-		// Byte 199 is the timestamp's least significant byte, so this shifts the
-		// stamp by one second and stays inside the ±120s window. Mutating byte 192
+		"kem":       {offset: kemOffset, verified: true},
+		// The timestamp's least significant byte shifts the
+		// stamp by one second and stays inside the ±120s window. Mutating its first byte
 		// instead would move it billions of years out, and the freshness check
 		// would reject it before the signature was ever considered.
-		"timestamp": {offset: 199, verified: true},
+		"timestamp": {offset: timestampOffset + 7, verified: true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			s, _, hello, src, now := fixture(t)
@@ -431,13 +431,16 @@ func TestRenewalChangesTagButNotOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, session := s.Handle(ctx, src, finish, now)
+	ack, session := s.Handle(ctx, src, finish, now)
 	if session == nil {
 		t.Fatal("initial handshake did not install")
 	}
+	if !first.Accepted(ack) {
+		t.Fatal("initial handshake was not acknowledged")
+	}
 	session.Installed(true)
 	disco := Keys{WG: src, Disco: [32]byte(hello[8+64 : 8+96])}
-	next, renewal, err := NewClient(ctx, first.identity, software.NewKEM, first.serverPublic, disco, first.keys, now.Add(time.Second))
+	next, renewal, err := NewClientWithState(ctx, first.identity, software.NewKEM, first.serverPublic, disco, first.keys, first.State(), now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
