@@ -227,12 +227,16 @@ func (t *memoryTUN) MTU() (int, error)        { return 1280, nil }
 func (t *memoryTUN) BatchSize() int           { return 1 }
 func (t *memoryTUN) Events() <-chan tun.Event { return t.events }
 func (t *memoryTUN) Close() error             { t.once.Do(func() { close(t.done); close(t.events) }); return nil }
-func (t *memoryTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+func (t *memoryTUN) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
 	select {
 	case <-t.done:
 		return 0, io.EOF
 	case p := <-t.in:
-		sizes[0] = copy(bufs[0][offset:], p)
+		if len(packets) == 0 || len(slab) < len(p)+2*tun.ReadPacketSpacing {
+			return 0, tun.ErrTooManySegments
+		}
+		offset := tun.ReadPacketSpacing
+		packets[0] = tun.ReadPacket{Offset: offset, Size: copy(slab[offset:], p)}
 		return 1, nil
 	}
 }
