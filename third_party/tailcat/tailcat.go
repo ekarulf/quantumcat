@@ -438,11 +438,16 @@ func (b *locoBackend) Close() error {
 // Server listens for clients over a WireGuard tunnel relayed through DERP.
 // Incoming TCP connections and UDP flows are dispatched via the OnTCP/OnUDP
 // callbacks (for traffic addressed to the server itself) and their Forward
-// counterparts (for traffic the server relays to other addresses).
+// counterparts (for traffic the server relays to other addresses), or
+// accepted from listeners created by [Server.Listen], which take precedence
+// over the callbacks for their ports.
 //
 // The zero value is a usable server: optionally populate the
 // configuration fields, then call [Server.Start], which picks
-// defaults for anything unset.
+// defaults for anything unset. [Server.Listen] starts the server
+// itself if needed, so callers using only listeners can skip Start.
+// Fields documented as needing to be set before Start must likewise
+// be set before the first Listen call.
 type Server struct {
 	BootstrapCleanup func()
 	BootstrapClose   func()
@@ -501,6 +506,15 @@ type Server struct {
 
 	lb *locoBackend // non-nil once Start has been called
 
+	// startMu serializes Start and the implicit start in Listen.
+	startMu sync.Mutex
+
+	// listenerMu guards the listener maps below and serializes packet
+	// filter rebuilds as the listener set changes.
+	listenerMu   sync.Mutex
+	tcpListeners map[uint16]*listener // keyed by port on the server's own address
+	udpListeners map[uint16]*listener // keyed by port on the server's own address
+
 	// AllowProxy, if non-nil, reports whether
 	// a TCP or UDP proxy is allowed for that target.
 	AllowProxy func(netip.AddrPort) bool
@@ -511,6 +525,8 @@ type Server struct {
 	//
 	// This only applies to connections directly to the server node and not
 	// when being a subnet router. See OnTCPForward for relayed connections.
+	// Connections to a port with an active [Server.Listen] listener go to
+	// that listener and are never offered to OnTCP.
 	//
 	// It must be set before calling Start.
 	OnTCP func(port uint16) (handler func(net.Conn))
@@ -535,6 +551,8 @@ type Server struct {
 	//
 	// This only applies to packets addressed directly to the server node and not
 	// when being a subnet router. See OnUDPForward for relayed packets.
+	// Flows to a port with an active [Server.Listen] listener go to that
+	// listener and are never offered to OnUDP.
 	//
 	// It must be set before calling Start.
 	OnUDP func(port uint16) (handler func(ConnPacketConn))
@@ -551,7 +569,8 @@ type Server struct {
 	// connections to. If nil, connections to all ports reach OnTCP,
 	// which remains the per-port gate either way. Callers that know
 	// their served ports statically (like the tailcat CLI) can set
-	// this for defense in depth.
+	// this for defense in depth. Ports with an active [Server.Listen]
+	// listener are always admitted, whether or not listed here.
 	//
 	// Unlike OnTCP's nil-handler response, packets dropped by the
 	// filter get no RST; a client dialing a filtered port times out.
@@ -561,7 +580,9 @@ type Server struct {
 
 	// ServedUDPPorts, if non-nil, restricts which UDP ports on the server's own
 	// address the packet filter admits. If nil, packets to all ports reach
-	// OnUDP, which remains the per-flow gate either way.
+	// OnUDP, which remains the per-flow gate either way. Ports with an
+	// active [Server.Listen] listener are always admitted, whether or
+	// not listed here.
 	//
 	// It must be set before calling Start.
 	ServedUDPPorts []filter.PortRange
@@ -595,7 +616,19 @@ const DefaultUDPIdleTimeout = 2 * time.Minute
 // first picking defaults for any unset configuration fields: a new
 // ephemeral key, log.Printf for logging, and the nearest region of
 // the default DERP map.
+//
+// It returns an error if the server was already started, including
+// implicitly by [Server.Listen].
 func (s *Server) Start() error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	return s.startLocked(context.Background())
+}
+
+// startLocked implements Start, with ctx bounding the startup network
+// work (fetching the DERP map and picking a region).
+// s.startMu must be held.
+func (s *Server) startLocked(ctx context.Context) error {
 	if s.lb != nil {
 		return errors.New("tailcat: Server.Start called twice")
 	}
@@ -626,7 +659,7 @@ func (s *Server) Start() error {
 		if s.DERPMapCache != nil {
 			opts = append(opts, s.DERPMapCache)
 		}
-		if err := ci.Expand(context.Background(), opts...); err != nil {
+		if err := ci.Expand(ctx, opts...); err != nil {
 			return err
 		}
 		reg = ci.Region[0]
@@ -883,6 +916,9 @@ func (s *Server) Start() error {
 	}
 	ns.GetTCPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
 		if dst.Addr() == lb.addr {
+			if ln := s.listenerForPort("tcp", dst.Port()); ln != nil {
+				return ln.handle, true
+			}
 			if s.OnTCP == nil {
 				return nil, true // send RST
 			}
@@ -902,7 +938,9 @@ func (s *Server) Start() error {
 	ns.GetUDPHandlerForFlow = func(src, dst netip.AddrPort) (handler func(nettype.ConnPacketConn), intercept bool) {
 		var h func(ConnPacketConn)
 		if dst.Addr() == lb.addr {
-			if s.OnUDP != nil {
+			if ln := s.listenerForPort("udp", dst.Port()); ln != nil {
+				h = func(c ConnPacketConn) { ln.handle(c) }
+			} else if s.OnUDP != nil {
 				h = s.OnUDP(dst.Port())
 			}
 		} else if s.OnUDPForward != nil {
@@ -936,14 +974,7 @@ func (s *Server) Start() error {
 	sys.Tun.Get().Start()
 
 	s.lb = lb
-	sys.Engine.Get().SetFilter(s.buildFilter())
-	if s.TUN != nil {
-		local := new(netipx.IPSetBuilder)
-		local.AddPrefix(lb.addrPrefix)
-		set, _ := local.IPSet()
-		rules := []filter.Match{{IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP, ipproto.UDP, ipproto.ICMPv6}), Srcs: []netip.Prefix{netip.MustParsePrefix("fd7a:7163:6174::/48")}, Dsts: []filter.NetPortRange{{Net: lb.addrPrefix, Ports: allPorts}}}}
-		sys.Engine.Get().SetFilter(filter.New(rules, nil, set, tailcatULASet(), nil, logf))
-	}
+	s.rebuildFilter()
 	if err := lb.Start(); err != nil {
 		s.lb = nil
 		lb.Close()
@@ -961,19 +992,55 @@ func (s *Server) udpIdleTimeout() time.Duration {
 
 var allPorts = filter.PortRange{First: 0, Last: 65535}
 
-// buildFilter returns the packet filter enforcing what the server is configured
-// to serve: inbound TCP connections and UDP flows are admitted only to the
-// server's own configured ports, plus to any destination for protocols whose
-// Forward callback is set (exit node mode).
+// rebuildFilter builds and installs the packet filter. It must be
+// called after s.lb is set, and again whenever the set of active
+// listeners changes.
+func (s *Server) rebuildFilter() {
+	s.listenerMu.Lock()
+	defer s.listenerMu.Unlock()
+	s.installFilterLocked()
+}
+
+// installFilterLocked builds and installs the packet filter.
+// s.listenerMu must be held.
+func (s *Server) installFilterLocked() {
+	s.lb.sys.Engine.Get().SetFilter(s.buildFilterLocked())
+}
+
+// appendListenerPorts appends one single-port range per port of m to
+// ranges and returns the result.
+func appendListenerPorts(ranges []filter.PortRange, m map[uint16]*listener) []filter.PortRange {
+	for port := range m {
+		ranges = append(ranges, filter.PortRange{First: port, Last: port})
+	}
+	return ranges
+}
+
+// buildFilterLocked returns the packet filter enforcing what the server is
+// configured to serve: inbound TCP connections and UDP flows are admitted only
+// to the server's own configured and listened-on ports, plus to any
+// destination for protocols whose Forward callback is set (exit node mode).
 // Everything else from the tunnel is dropped before reaching
-// netstack; the OnTCP/OnTCPForward callbacks remain the
-// per-connection gates behind it.
-func (s *Server) buildFilter() *filter.Filter {
+// netstack; the OnTCP/OnTCPForward callbacks and the listener
+// map remain the per-connection gates behind it.
+// s.listenerMu must be held.
+func (s *Server) buildFilterLocked() *filter.Filter {
 	lb := s.lb
+	if s.TUN != nil {
+		local := new(netipx.IPSetBuilder)
+		local.AddPrefix(lb.addrPrefix)
+		set, _ := local.IPSet()
+		rules := []filter.Match{{
+			IPProto: views.SliceOf([]ipproto.Proto{ipproto.TCP, ipproto.UDP, ipproto.ICMPv6}),
+			Srcs:    []netip.Prefix{netip.MustParsePrefix("fd7a:7163:6174::/48")},
+			Dsts:    []filter.NetPortRange{{Net: lb.addrPrefix, Ports: allPorts}},
+		}}
+		return filter.New(rules, nil, set, tailcatULASet(), nil, lb.logf)
+	}
 
 	selfPorts := []filter.PortRange{allPorts}
 	if s.ServedTCPPorts != nil {
-		selfPorts = s.ServedTCPPorts
+		selfPorts = appendListenerPorts(slices.Clone(s.ServedTCPPorts), s.tcpListeners)
 	}
 	var selfDsts []filter.NetPortRange
 	for _, pr := range selfPorts {
@@ -984,10 +1051,16 @@ func (s *Server) buildFilter() *filter.Filter {
 		Srcs:    []netip.Prefix{allIPv6},
 		Dsts:    selfDsts,
 	}}
-	if s.OnUDP != nil {
-		udpPorts := []filter.PortRange{allPorts}
-		if s.ServedUDPPorts != nil {
-			udpPorts = s.ServedUDPPorts
+	if s.OnUDP != nil || len(s.udpListeners) > 0 {
+		var udpPorts []filter.PortRange
+		switch {
+		case s.OnUDP == nil:
+			// Without OnUDP, only listener ports can be served.
+			udpPorts = appendListenerPorts(nil, s.udpListeners)
+		case s.ServedUDPPorts != nil:
+			udpPorts = appendListenerPorts(slices.Clone(s.ServedUDPPorts), s.udpListeners)
+		default:
+			udpPorts = []filter.PortRange{allPorts}
 		}
 		udpDsts := make([]filter.NetPortRange, 0, len(udpPorts))
 		for _, pr := range udpPorts {
@@ -1030,14 +1103,24 @@ func (s *Server) buildFilter() *filter.Filter {
 }
 
 // Addr returns the server's IPv6 address derived from its public key.
-// It must only be called after [Server.Start].
+// It must only be called after the server has started, via
+// [Server.Start] or [Server.Listen].
 func (s *Server) Addr() netip.Addr { return s.lb.addr }
 
-// Close shuts down the server, closing the WireGuard engine and DERP connections.
+// Close shuts down the server, closing any listeners created by
+// [Server.Listen] along with the WireGuard engine and DERP connections.
 func (s *Server) Close() error {
 	if s.lb == nil {
 		return nil // never started
 	}
+	s.listenerMu.Lock()
+	for _, ln := range s.tcpListeners {
+		ln.closeLocked(false)
+	}
+	for _, ln := range s.udpListeners {
+		ln.closeLocked(false)
+	}
+	s.listenerMu.Unlock()
 	return s.lb.Close()
 }
 
@@ -1154,7 +1237,7 @@ func (s *Server) AddAllowedClient(k key.NodePublic) {
 // TailcatAddr returns the tailcat address that clients use to connect to this
 // server. It embeds the full DERP region, so clients don't need to
 // fetch the DERP map from the network. It must only be called after
-// [Server.Start].
+// the server has started, via [Server.Start] or [Server.Listen].
 func (s *Server) TailcatAddr() Addr {
 	return s.lb.tailcatAddr()
 }
@@ -1938,6 +2021,7 @@ func (b *locoBackend) removeAuthenticatedPeer(k key.NodePublic) {
 func (b *locoBackend) Status() *ipnstate.Status {
 	mc := b.sys.MagicSock.Get()
 	eng := b.sys.Engine.Get()
+	// Without WantPeers, magicsock and wgengine skip their peer loops and Peer is empty.
 	sb := ipnstate.StatusBuilder{WantPeers: true}
 	mc.UpdateStatus(&sb)
 	eng.UpdateStatus(&sb)
@@ -2767,7 +2851,8 @@ func (c *idlePacketConn) Close() error {
 	return c.ConnPacketConn.Close()
 }
 
-// Status returns the current WireGuard and DERP connection status.
+// Status returns the current WireGuard and DERP connection status. Each connected
+// client has a Peer entry; its CurAddr and Relay show a direct or DERP-relayed path.
 func (s *Server) Status() *ipnstate.Status {
 	return s.lb.Status()
 }
