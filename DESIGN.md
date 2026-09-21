@@ -569,20 +569,30 @@ ML-KEM produces a shared secret.
 Derive:
 
 ```text
+handshake_prk = HKDF-SHA384-Extract(
+    salt = "qcat-handshake-extract-v1",
+    IKM = mlkem_shared_secret
+)
+
 wireguard_psk = HKDF-SHA384-Expand(
-    mlkem_shared_secret,
-    "qcat-wireguard-psk-v2" || transcript_hash,
+    handshake_prk,
+    "qcat-wireguard-psk-v3" || transcript_hash,
     32
 )
 
 handshake_key = HKDF-SHA384-Expand(
-    mlkem_shared_secret,
-    "qcat-handshake-confirm-v2" || transcript_hash,
+    handshake_prk,
+    "qcat-handshake-confirm-v3" || transcript_hash,
     32
 )
 ```
 
-Erase the raw ML-KEM shared secret as soon as practical.
+The fixed, non-secret salt gives Quantumcat's handshake schedule its own
+extraction domain. Extract first normalizes the ML-KEM output into a 48-byte
+SHA-384 pseudorandom key; the distinct Expand labels then separate the two
+purposes and bind both keys to the canonical transcript.
+
+Erase the raw ML-KEM shared secret and `handshake_prk` as soon as practical.
 
 The 32-byte `wireguard_psk` becomes the WireGuard preshared key.
 
@@ -767,9 +777,25 @@ An attacker recording WireGuard traffic and later obtaining a cryptographically 
 
 ---
 
-## 22.6 PQ forward secrecy
+## 22.6 PQ forward secrecy and renewal recovery
 
 Because the ML-KEM client private key is freshly generated for the connection and destroyed afterwards, later compromise of the persistent device identity key does not reveal previous session PSKs.
+
+Each renewal generates another independent ephemeral ML-KEM key. If an attacker
+captures normal process memory and current session keys, then loses access
+before a later renewal begins, the fresh ML-KEM shared secret makes the renewed
+PSK independent of the captured state. After one successful uncompromised
+renewal, that earlier snapshot is insufficient to follow the session. This
+property does not require a persistent root or server-side ratchet state.
+
+This is recovery from an ended snapshot or offline compromise, not protection
+from continuing endpoint control. An attacker that remains able to execute in
+`qcat`, inspect newly derived keys, invoke `qcat-se`, alter installation, or
+suppress renewal can continue following or controlling the tunnel. The Secure
+Enclave reduces private-key extraction and normal-process exposure; it does not
+make an actively compromised endpoint trustworthy. Compromise of an ML-DSA
+identity key can also authorize future impersonation and is not repaired by
+renewal.
 
 ---
 
@@ -1367,7 +1393,7 @@ ML-DSA-87
 SHA-512/256 for stable PeerIDs
 SHA-384
 HMAC-SHA-384
-HKDF-Expand
+HKDF-Extract and HKDF-Expand
 crypto/rand
 ```
 

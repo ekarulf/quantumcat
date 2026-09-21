@@ -344,10 +344,10 @@ func TestDeriveKnownAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := hex.EncodeToString(psk[:]), "4382598d92933ba95a56715c284157d77f3f9b99dff5a654c74455670421d02d"; got != want {
+	if got, want := hex.EncodeToString(psk[:]), "c1dcee51bc6e0a4a1ed5d6e13d51718d8c8b1a10c5bcc54f427701586c3396e0"; got != want {
 		t.Fatalf("PSK = %s, want %s", got, want)
 	}
-	if got, want := hex.EncodeToString(confirmation[:]), "376e3da389d23edb393e42bde1abedebae3b87dd86439fb85ebbdb9c3c8abd02"; got != want {
+	if got, want := hex.EncodeToString(confirmation[:]), "8764278991485b2124162ee40dd70ca5845526ac5eaf853d9b720f297b7430cb"; got != want {
 		t.Fatalf("confirmation = %s, want %s", got, want)
 	}
 }

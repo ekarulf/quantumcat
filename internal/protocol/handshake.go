@@ -20,12 +20,17 @@ import (
 var ErrRejected = errors.New("handshake rejected")
 
 func derive(ss []byte, hash [hashSize]byte) (psk, confirmation [32]byte, err error) {
-	p, err := hkdf.Expand(sha512.New384, ss, "qcat-wireguard-psk-v2"+string(hash[:]), 32)
+	prk, err := hkdf.Extract(sha512.New384, ss, []byte("qcat-handshake-extract-v1"))
+	if err != nil {
+		return psk, confirmation, err
+	}
+	defer clear(prk)
+	p, err := hkdf.Expand(sha512.New384, prk, "qcat-wireguard-psk-v3"+string(hash[:]), 32)
 	if err != nil {
 		return psk, confirmation, err
 	}
 	defer clear(p)
-	c, err := hkdf.Expand(sha512.New384, ss, "qcat-handshake-confirm-v2"+string(hash[:]), 32)
+	c, err := hkdf.Expand(sha512.New384, prk, "qcat-handshake-confirm-v3"+string(hash[:]), 32)
 	if err != nil {
 		return psk, confirmation, err
 	}
