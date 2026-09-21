@@ -114,12 +114,18 @@ The transcript serves two distinct roles:
   used in HKDF info, HMAC confirmation, ClientFinish and ServerAccepted, and
   the pending and replay tables; it is not the signed message.
 
-Because the ML-KEM shared secret is already pseudorandom, HKDF-Expand with
-SHA-384 derives separate 32-byte keys directly. Its info strings are
-`qcat-wireguard-psk-v2 || transcript_hash` and
-`qcat-handshake-confirm-v2 || transcript_hash`. Proofs use HMAC-SHA-384 under
-the confirmation key over a label followed by the transcript hash. Labels:
-`server-finished`, `client-finished`, `server-accepted`.
+The key schedule first applies HKDF-SHA384-Extract with the fixed, non-secret
+salt `qcat-handshake-extract-v1` and the ML-KEM shared secret as input keying
+material. This produces a 48-byte handshake PRK. HKDF-SHA384-Expand then derives
+separate 32-byte keys with info strings
+`qcat-wireguard-psk-v3 || transcript_hash` and
+`qcat-handshake-confirm-v3 || transcript_hash`. The extraction salt separates
+Quantumcat's handshake schedule from other possible uses of the KEM secret; the
+Expand labels separate key purposes and bind both keys to the transcript.
+Proofs use HMAC-SHA-384 under the confirmation key over a label followed by the
+transcript hash. Labels: `server-finished`, `client-finished`,
+`server-accepted`. The raw shared secret and handshake PRK are erased as soon as
+practical.
 
 The DERP source must equal the signed client WG key. The client checks the
 server identity and transport keys against its paired descriptor. Timestamps
