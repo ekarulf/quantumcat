@@ -5,6 +5,10 @@ updates:
     schedule:
       interval: "weekly"
     ignore:
-      # The local replacement is a reduced source snapshot. Update its source
-      # and module metadata together during deliberate upstream rebases.
+      # Tailcat is a reduced local source snapshot, and these versions are a
+      # coordinated compatibility set. Update them together during deliberate
+      # upstream Tailcat rebases instead of in independent Dependabot PRs.
       - dependency-name: "github.com/tailscale/tailcat"
+      - dependency-name: "github.com/tailscale/wireguard-go"
+      - dependency-name: "tailscale.com"
+      - dependency-name: "gvisor.dev/gvisor"
