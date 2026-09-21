@@ -1,4 +1,4 @@
-// Package protocol implements Quantumcat's version 2 authenticated PSK bootstrap.
+// Package protocol implements Quantumcat's version 1 authenticated PSK bootstrap.
 package protocol
 
 import (
@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	Version          = 2
+	Version          = 1
 	MaxPacket        = 32768
 	ClientHello      = 1
 	ServerHello      = 2
@@ -22,14 +22,14 @@ const (
 	ServerAccepted   = 4
 	hashSize         = sha512.Size384
 	proofSize        = sha512.Size384
-	helloSize        = 32*5 + hashSize + 8 + 8 + mlkem.EncapsulationKeySize1024
+	helloSize        = 32*6 + 8 + mlkem.EncapsulationKeySize1024
 	serverSize       = 32*4 + mlkem.CiphertextSize1024 + mldsa.MLDSA87SignatureSize + proofSize
 	transcriptSize   = len(transcriptDomain) + 1 + 32*4 + mlkem.CiphertextSize1024 + helloSize
-	ClientContext    = "qcat-handshake-client-v2"
-	ServerContext    = "qcat-handshake-server-v2"
+	ClientContext    = "qcat-handshake-client-v1"
+	ServerContext    = "qcat-handshake-server-v1"
 	peerIDDomain     = "qcat-peer-v1" // Frozen independently of Version.
 	peerTagDomain    = "qcat-peer-tag-v1"
-	transcriptDomain = "qcat-transcript-v2"
+	transcriptDomain = "qcat-transcript-v1"
 	rootDomain       = "qcat-renew-root-v1"
 )
 
@@ -39,9 +39,9 @@ const (
 	clientDiscoOffset   = clientWGOffset + 32
 	nonceOffset         = clientDiscoOffset + 32
 	serverIDOffset      = nonceOffset + 32
-	parentHashOffset    = serverIDOffset + 32
-	epochOffset         = parentHashOffset + hashSize
-	timestampOffset     = epochOffset + 8
+	epochOffset         = serverIDOffset + 32
+	reservedTailOffset  = epochOffset + 8
+	timestampOffset     = serverIDOffset + 64
 	kemOffset           = timestampOffset + 8
 )
 

@@ -43,7 +43,7 @@ func serverWithLifetime(identity provider.Identity, pub []byte, node key.NodePri
 			if session == nil {
 				return reply, nil
 			}
-			peer := &tailcat.AuthenticatedPeer{Identity: [32]byte(session.Peer), Disco: key.DiscoPublicFromRaw32(mem.B(session.Keys.Disco[:])), PSK: tailcat.PresharedKey(session.PSK), Installed: session.Installed}
+			peer := &tailcat.AuthenticatedPeer{Identity: [32]byte(session.Peer), Disco: key.DiscoPublicFromRaw32(mem.B(session.Keys.Disco[:])), PSK: tailcat.PresharedKey(session.PSK), Installed: session.Installed, Removed: func() { p.Remove(src.Raw32()) }}
 			id := session.Peer
 			pinned := append([]byte(nil), protocol.Lookup(authorized, id)...)
 			expires := time.Now().Add(lifetime)
@@ -75,6 +75,18 @@ func Client(identity provider.Identity, newKEM provider.NewKEM, pub []byte, endp
 	var pendingPacket []byte
 	var pendingPSK [32]byte
 	var stateMu sync.Mutex
+	c.BootstrapClose = func() {
+		stateMu.Lock()
+		defer stateMu.Unlock()
+		clear(state.Root[:])
+		if pending != nil {
+			pending.Close()
+			pending = nil
+		}
+		clear(pendingPacket)
+		pendingPacket = nil
+		clear(pendingPSK[:])
+	}
 	c.Bootstrap = func(ctx context.Context, send func([]byte) error, recv <-chan []byte) (tailcat.PresharedKey, error) {
 		ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 		defer cancel()
@@ -121,11 +133,26 @@ func Client(identity provider.Identity, newKEM provider.NewKEM, pub []byte, endp
 				}
 			case reply := <-recv:
 				if finishing {
+					if handshake.Rejected(reply) {
+						stateMu.Lock()
+						if pending == handshake {
+							pending = nil
+							clear(pendingPacket)
+							pendingPacket = nil
+							clear(pendingPSK[:])
+						}
+						stateMu.Unlock()
+						handshake.Close()
+						return tailcat.PresharedKey{}, protocol.ErrRejected
+					}
 					if handshake.Accepted(reply) {
 						stateMu.Lock()
+						clear(state.Root[:])
 						state = handshake.State()
 						if pending == handshake {
-							pending, pendingPacket = nil, nil
+							pending = nil
+							clear(pendingPacket)
+							pendingPacket = nil
 							clear(pendingPSK[:])
 						}
 						stateMu.Unlock()

@@ -1,4 +1,4 @@
-# Quantumcat bootstrap v2
+# Quantumcat bootstrap v1
 
 This pre-release definition freezes PeerID at SHA-512/256, makes the server
 sign the canonical transcript bytes with pure ML-DSA-87 instead of their
@@ -7,26 +7,26 @@ tag. The PeerID change is not identity-file- or pairing-compatible with
 earlier builds. The signature and blinding changes are wire-incompatible but
 need no additional re-pairing: identity keys and PeerIDs are unaffected.
 
-Version 2 is intentionally wire-incompatible with version 1: a v1 hello has
-no authenticated space for a 48-byte parent transcript hash and 64-bit epoch.
-Both ends of a tunnel must be upgraded together; pairing identities remain
-compatible.
+This pre-release revision assigns the first eight of ClientHello's 32 reserved
+bytes to a renewal epoch. The remaining 24 bytes stay zero. Both ends of a
+tunnel must be upgraded together; pairing identities remain compatible. The
+wire version and frame sizes remain unchanged while v1 is under development.
 
-Network frames: ASCII `QCAT`, version byte `2`, message-type byte, big-endian
+Network frames: ASCII `QCAT`, version byte `1`, message-type byte, big-endian
 uint16 payload length, payload. The header is eight bytes. Hard limit: 32768
 bytes. Every type has an exact size; reject unknown types, versions, and trailing
 bytes. All integers use big-endian encoding.
 
 | Type | Payload, in order | Bytes |
 | --- | --- | --- |
-| 1 ClientHello | client peer tag (32), WG public (32), disco public (32), nonce (32), server PeerID (32), previous transcript hash (48), renewal epoch (8), Unix timestamp (8), KEM public (1568), signature (4627) | 6419 |
+| 1 ClientHello | client peer tag (32), WG public (32), disco public (32), nonce (32), server PeerID (32), renewal epoch (8), reserved zeros (24), Unix timestamp (8), KEM public (1568), signature (4627) | 6395 |
 | 2 ServerHello | server PeerID (32), WG public (32), disco public (32), nonce (32), ciphertext (1568), signature (4627), server proof (48) | 6371 |
 | 3 ClientFinish | transcript hash (48), client proof (48) | 96 |
 | 4 ServerAccepted | transcript hash (48), acknowledgement proof (48) | 96 |
 
-ClientHello signs its unsigned frame, whose header payload length is **1792**
-(not the transmitted length 6419), with ML-DSA context
-`qcat-handshake-client-v2`.
+ClientHello signs its unsigned frame, whose header payload length is **1768**
+(not the transmitted length 6395), with ML-DSA context
+`qcat-handshake-client-v1`.
 Public ML-DSA keys are 2592 bytes, obtained from the local pairing store.
 PeerID is SHA-512/256 over `qcat-peer-v1` followed by that key. This derivation
 is frozen independently of the wire suite. Text IDs use `qpeer:` plus unpadded
@@ -94,22 +94,22 @@ What the tag does and does not hide on the wire:
 * The server's PeerID and transport keys are still sent in the clear, and the
   bootstrap is still trivially recognizable as Quantumcat. See DESIGN.md §22.8.
 
-The canonical transcript is this fixed **3507-byte** concatenation:
+The canonical transcript is this fixed **3483-byte** concatenation:
 
 ```text
-"qcat-transcript-v2" || version_byte ||
+"qcat-transcript-v1" || version_byte ||
 server_peer_id || server_wg_public || server_disco_public ||
 server_nonce || kem_ciphertext || complete_unsigned_client_hello
 ```
 
-The complete unsigned ClientHello includes its blinded peer tag, ratchet parent,
-epoch and timestamp, so the tag as transmitted is covered by both the client's
+The complete unsigned ClientHello includes its blinded peer tag, epoch, reserved
+bytes and timestamp, so the tag as transmitted is covered by both the client's
 ML-DSA signature and the server's transcript. Substituting a different tag, or
 reusing a signature made over other bytes in that field, fails verification.
 The transcript serves two distinct roles:
 
 * **ServerHello signs the canonical transcript bytes themselves** with pure
-  ML-DSA-87 under the application context `qcat-handshake-server-v2`. It does
+  ML-DSA-87 under the application context `qcat-handshake-server-v1`. It does
   **not** sign a digest. FIPS 204 §5.4 prefers pure ML-DSA and requires an
   application-level pre-hash to provide λ bits of both collision and
   second-preimage strength. For ML-DSA-87, λ is 256, so a conventional digest
@@ -121,13 +121,15 @@ The transcript serves two distinct roles:
 
 The private root is advanced with HKDF-Extract (HMAC-SHA-384) using the
 previous root as salt and `qcat-renew-root-v1 || mlkem_shared_secret ||
-previous_transcript_hash || transcript_hash || renewal_epoch` as input. The
-initial bootstrap uses an all-zero root and all-zero previous hash. Separate
+previous_transcript_hash || transcript_hash || renewal_epoch` as input. Every
+component after the domain is fixed-width, so this concatenation is unambiguous.
+The parent hash is taken from local committed state and is never sent. Initial
+bootstrap uses an all-zero root and all-zero previous hash. Separate
 32-byte keys are then expanded from the new root with
 `qcat-wireguard-psk-v3 || transcript_hash` and
 `qcat-handshake-confirm-v3 || transcript_hash`. Proofs use HMAC-SHA-384 under
 the confirmation key over a label followed by the transcript hash. Labels:
-`server-finished`, `client-finished`, `server-accepted`.
+`server-finished`, `client-finished`, `server-accepted`, `server-rejected`.
 
 The DERP source must equal the signed client WG key. The client checks the
 server identity and transport keys against its paired descriptor. Timestamps
@@ -136,10 +138,13 @@ Exact duplicate ClientHellos receive a cached response without re-encapsulation.
 The replay key stays `SHA-384(client_peer_id || client_nonce)` over the resolved
 real PeerID, not the blinded tag, so blinding does not widen the replay window.
 
-Uncommitted pending state expires after 30 seconds. After a successful install,
-the server retains only the confirmation material for five minutes so a client
-that timed out after sending ClientFinish can retry the same authenticated
-finish and converge on the committed ratchet state.
+Uncommitted pending state expires after 30 seconds. A failed transport install
+leaves the committed root untouched, erases the candidate root and PSK, and
+retains its confirmation key briefly. The client's next identical finish gets
+an authenticated `server-rejected` proof; the client then starts a fresh attempt
+from its still-committed parent. After a successful install, the server can
+reconstruct the current transcript's confirmation key from the committed root,
+so a lost ServerAccepted can be retried even after pending state is erased.
 Clients have a 25-second budget and retry once per second. ClientFinish includes
 the transcript hash to identify the session. Type 4 is an authenticated
 acknowledgement, replacing the design's optional Error message. This handles
@@ -198,12 +203,15 @@ renewals linkable for that client's lifetime. The server permits replacement of
 an active node's PSK and lease only for the same authenticated PQ identity and
 discovery key. Duplicate finishes only resend their acknowledgement; they never
 extend a lease or reinstall an older PSK. Revoked identities cannot renew.
-The signed ClientHello carries the immediately preceding transcript hash and
-the next monotonic renewal epoch. The server accepts epoch zero only for a new
-WireGuard node; afterwards it accepts only `committed_epoch + 1` naming the
-committed transcript. It commits the derived root, hash, and epoch only after
-transport installation succeeds. This rejects stale or forked renewal paths and
-chains each ML-KEM secret with the previous uncompromised root. Selecting a finish for installation invalidates competing pending transcripts
+The signed ClientHello carries the next monotonic renewal epoch. While a lease
+exists, the server accepts only `committed_epoch + 1`; both sides bind their
+locally committed parent transcript in the KDF. Ratchet state is owned by the
+same record as the transport lease and is erased on expiry, eviction, or
+revocation. If that state is absent after a restart, the server derives from the
+zero root at the client's proposed epoch; the client accepts the reset only when
+that alternate confirmation proof verifies. It commits the derived root, hash,
+and epoch only after transport installation succeeds. This rejects stale or
+forked renewal paths while state exists. Selecting a finish for installation invalidates competing pending transcripts
 for the same source (and erases their key material). A second installation for
 that source cannot begin while the first is outstanding. Only the surviving
 committed transcript may resend its cached acknowledgement.

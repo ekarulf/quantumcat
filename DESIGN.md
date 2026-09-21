@@ -392,7 +392,9 @@ ClientHello {
 
     server_peer_id
 
-    reserved            (32 zero bytes)
+    renewal_epoch
+
+    reserved            (24 zero bytes)
 
     timestamp
 
@@ -423,7 +425,7 @@ The signature binds:
 * the connection nonce
 * protocol version
 * handshake freshness
-* the reserved bytes, so a v1 server cannot be talked into ignoring extensions
+* the next renewal epoch and reserved bytes
 
 An intercepted ClientHello cannot be repurposed toward another server.
 
@@ -440,7 +442,7 @@ On receiving ClientHello:
 4. Parse with bounded allocations.
 5. Check the cheap field bindings: the DERP source equals the signed WG key,
    the discovery key is non-zero, server_peer_id names this server, and the
-   reserved bytes are zero.
+   24 unassigned reserved bytes are zero.
 6. Check timestamp/freshness.
 7. Apply per-source rate limiting.
 8. Resolve client_peer_tag to an authorized PeerID.
@@ -448,8 +450,10 @@ On receiving ClientHello:
 10. Charge the shared verification budget.
 11. Check the replay cache, then the pending and replay capacity limits.
 12. Verify ML-DSA-87 signature.
-13. Apply per-PeerID rate limiting.
-14. Only then perform ML-KEM encapsulation.
+13. Require epoch zero and a zero parent for bootstrap, or exactly the next
+    epoch and current committed transcript for renewal.
+14. Apply per-PeerID rate limiting.
+15. Only then perform ML-KEM encapsulation.
 ```
 
 This order is intentional.
@@ -564,27 +568,54 @@ Do not use JSON for the wire protocol.
 
 # 17. PSK derivation
 
-ML-KEM produces a shared secret.
+ML-KEM produces a fresh shared secret. Quantumcat keeps a separate 48-byte
+session root for each active WireGuard identity. Bootstrap uses an all-zero
+parent root, parent transcript, and epoch zero. A renewal uses the last
+committed root and names its transcript and the next epoch.
 
 Derive:
 
 ```text
+session_root = HMAC-SHA384(
+    key = previous_session_root,
+    message =
+        "qcat-renew-root-v1" ||
+        mlkem_shared_secret ||
+        previous_transcript_hash ||
+        transcript_hash ||
+        renewal_epoch_be64
+)
+
 wireguard_psk = HKDF-SHA384-Expand(
-    mlkem_shared_secret,
-    "qcat-wireguard-psk-v2" || transcript_hash,
+    session_root,
+    "qcat-wireguard-psk-v3" || transcript_hash,
     32
 )
 
 handshake_key = HKDF-SHA384-Expand(
-    mlkem_shared_secret,
-    "qcat-handshake-confirm-v2" || transcript_hash,
+    session_root,
+    "qcat-handshake-confirm-v3" || transcript_hash,
     32
 )
 ```
 
-Erase the raw ML-KEM shared secret as soon as practical.
+This HMAC is HKDF-Extract with the previous root as salt. Every concatenated
+field after the domain is fixed-width. The parent transcript comes from each
+endpoint's committed local state rather than the wire. Erase the raw ML-KEM
+shared secret as soon as practical. Commit the candidate root only after the
+transport installation succeeds; a failed attempt leaves the prior root active.
+The server authenticates installation failure under the candidate handshake key
+before the client discards it and retries from that prior root.
 
 The 32-byte `wireguard_psk` becomes the WireGuard preshared key.
+
+Ratchet state is in-memory and has exactly the lifetime of its WireGuard lease;
+expiry, eviction, or revocation erases both. It is not replicated for failover.
+After a server restart or move to a replica, the server derives from the zero
+root at the signed client epoch. The client tests that alternate confirmation
+key only after its normal chained proof fails, so an unauthenticated packet or a
+corrupted proof cannot force reset. This authenticated reset preserves
+availability but deliberately gives up the missing parent root's hedge.
 
 ---
 
@@ -770,6 +801,15 @@ An attacker recording WireGuard traffic and later obtaining a cryptographically 
 ## 22.6 PQ forward secrecy
 
 Because the ML-KEM client private key is freshly generated for the connection and destroyed afterwards, later compromise of the persistent device identity key does not reveal previous session PSKs.
+
+Renewals also chain a private session root with each fresh ML-KEM shared secret.
+The existing fresh-secret renewal already recovers after disclosure of an old
+PSK/root. Chaining adds the complementary hedge: a new root remains unknown when
+the fresh KEM input is weak or exposed but the parent root remains secret. This
+matters most for software KEM providers, while still hedging server randomness
+for Secure Enclave clients. It does not recover an ML-DSA identity compromise.
+This is a protocol-specific sparse-ratchet claim, not a claim to Signal's
+asynchronous or per-message security properties.
 
 ---
 

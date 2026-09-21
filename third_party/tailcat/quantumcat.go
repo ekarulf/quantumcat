@@ -85,6 +85,7 @@ type AuthenticatedPeer struct {
 	PSK       PresharedKey
 	Valid     func() bool
 	Installed func(bool)
+	Removed   func()
 }
 
 // Renew repeats authentication without recreating the device, netstack, node

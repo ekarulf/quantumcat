@@ -338,6 +338,7 @@ type locoBackend struct {
 	peerValid        map[key.NodePublic]func() bool
 	peerOwners       map[key.NodePublic][32]byte
 	peerInstalled    map[key.NodePublic]time.Time
+	peerRemoved      map[key.NodePublic]func()
 	nextClientID     int
 	bootstrapDone    chan struct{}
 	authenticated    bool
@@ -673,6 +674,7 @@ func (s *Server) Start() error {
 		lb.peerValid = make(map[key.NodePublic]func() bool)
 		lb.peerOwners = make(map[key.NodePublic][32]byte)
 		lb.peerInstalled = make(map[key.NodePublic]time.Time)
+		lb.peerRemoved = make(map[key.NodePublic]func())
 	}
 	type incoming struct {
 		region tailcfg.DERPRegionID
@@ -700,12 +702,17 @@ func (s *Server) Start() error {
 					}
 					lb.mu.Lock()
 					var removed []key.NodePublic
+					var removedCallbacks []func()
 					for k, valid := range lb.peerValid {
 						if valid == nil || !valid() {
+							if callback := lb.peerRemoved[k]; callback != nil {
+								removedCallbacks = append(removedCallbacks, callback)
+							}
 							delete(lb.peerPSKs, k)
 							delete(lb.peerValid, k)
 							delete(lb.peerOwners, k)
 							delete(lb.peerInstalled, k)
+							delete(lb.peerRemoved, k)
 							delete(lb.clients, k)
 							removed = append(removed, k)
 						}
@@ -721,6 +728,9 @@ func (s *Server) Start() error {
 						lb.sys.Netstack.Get().UpdateNetstackIPs(&nm)
 					}
 					lb.mu.Unlock()
+					for _, callback := range removedCallbacks {
+						callback()
+					}
 					for _, k := range removed {
 						lb.sys.Engine.Get().SyncDevicePeer(k)
 						if lb.tunnelPeer != nil {
@@ -811,6 +821,11 @@ func (s *Server) Start() error {
 						}
 					}
 					finishInstallation(true)
+					lb.mu.Lock()
+					if _, installed := lb.peerPSKs[p.src]; installed {
+						lb.peerRemoved[p.src] = peer.Removed
+					}
+					lb.mu.Unlock()
 				}
 				if len(reply) > 0 {
 					lb.sys.MagicSock.Get().SendDERPPacketTo(p.src, p.region, reply)
@@ -1916,11 +1931,13 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 // removeAuthenticatedPeer rolls back all networking state after a failed install.
 func (b *locoBackend) removeAuthenticatedPeer(k key.NodePublic) {
 	b.mu.Lock()
+	removed := b.peerRemoved[k]
 	delete(b.clients, k)
 	delete(b.peerPSKs, k)
 	delete(b.peerValid, k)
 	delete(b.peerOwners, k)
 	delete(b.peerInstalled, k)
+	delete(b.peerRemoved, k)
 	if b.nm != nil {
 		nm := *b.nm
 		nm.Peers = nil
@@ -1932,6 +1949,9 @@ func (b *locoBackend) removeAuthenticatedPeer(k key.NodePublic) {
 		b.sys.Netstack.Get().UpdateNetstackIPs(&nm)
 	}
 	b.mu.Unlock()
+	if removed != nil {
+		removed()
+	}
 	b.sys.Engine.Get().SyncDevicePeer(k)
 }
 
@@ -2029,6 +2049,7 @@ func createEngine(logf logger.Logf, lb *locoBackend) (err error) {
 type Client struct {
 	TUN            tun.Device
 	Bootstrap      func(context.Context, func([]byte) error, <-chan []byte) (PresharedKey, error)
+	BootstrapClose func()
 	bootstrapInbox chan []byte
 	// Server is the tailcat address identifying the server to connect to.
 	// It is required and must be set before the client's first use.
@@ -2245,6 +2266,10 @@ func (c *Client) Close() error {
 	c.startMu.Lock()
 	defer c.startMu.Unlock()
 	c.closed = true
+	if c.BootstrapClose != nil {
+		c.BootstrapClose()
+		c.BootstrapClose = nil
+	}
 	if c.lb == nil {
 		return nil // never used
 	}

@@ -62,17 +62,17 @@ func TestClientHelloOmitsRawPeerID(t *testing.T) {
 	}
 }
 
-// Version 2 extends the signed hello with its ratchet parent and epoch.
-func TestBlindingDoesNotChangeWireSize(t *testing.T) {
+// Version 1 remains intentionally mutable before the wire format is frozen.
+func TestVersionOneRatchetWireSize(t *testing.T) {
 	_, _, hello, _, _ := fixture(t)
-	if helloSize != 32*5+hashSize+8+8+1568 {
-		t.Fatalf("unsigned hello = %d bytes, want %d", helloSize, 32*5+hashSize+8+8+1568)
+	if helloSize != 32*6+8+1568 {
+		t.Fatalf("unsigned hello = %d bytes, want %d", helloSize, 32*6+8+1568)
 	}
 	if got, want := len(hello), 8+helloSize+mldsa.MLDSA87SignatureSize; got != want {
 		t.Fatalf("ClientHello frame = %d bytes, want %d", got, want)
 	}
-	if len(hello) != 8+6419 {
-		t.Fatalf("ClientHello payload = %d bytes, want 6419", len(hello)-8)
+	if len(hello) != 8+6395 {
+		t.Fatalf("ClientHello payload = %d bytes, want 6395", len(hello)-8)
 	}
 }
 

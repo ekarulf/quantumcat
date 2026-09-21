@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/binary"
+	"encoding/hex"
 	"testing"
 	"time"
 
@@ -70,7 +71,7 @@ func TestHandshakeAndRetransmission(t *testing.T) {
 	}
 }
 
-func TestFailedInstallationCannotBeAcknowledgedOnRetry(t *testing.T) {
+func TestFailedInstallationReturnsAuthenticatedRejection(t *testing.T) {
 	s, c, hello, src, now := fixture(t)
 	ctx := context.Background()
 	reply, _ := s.Handle(ctx, src, hello, now)
@@ -87,11 +88,13 @@ func TestFailedInstallationCannotBeAcknowledgedOnRetry(t *testing.T) {
 	}
 	session.Installed(false)
 	session.Installed(true) // A failure cannot later be committed.
-	if ack, next := s.Handle(ctx, src, finish, now); ack != nil || next != nil {
-		t.Fatal("acknowledged rejected installation")
+	rejection, next := s.Handle(ctx, src, finish, now)
+	if next != nil || !c.Rejected(rejection) || c.Accepted(rejection) {
+		t.Fatal("installation failure was not authenticated as a rejection")
 	}
-	if len(s.pending) != 0 {
-		t.Fatal("retained rejected session secrets")
+	p := s.pending[[hashSize]byte(finish[8:8+hashSize])]
+	if p == nil || !p.rejected || p.session.PSK != [32]byte{} || p.state.Root != [hashSize]byte{} {
+		t.Fatal("rejected candidate retained installation key material")
 	}
 }
 
@@ -229,14 +232,14 @@ func TestValidFrame(t *testing.T) {
 	}
 }
 
-func TestVersionTwoSHA384Sizes(t *testing.T) {
-	if Version != 2 || hashSize != sha512.Size384 || proofSize != sha512.Size384 {
+func TestVersionOneSHA384Sizes(t *testing.T) {
+	if Version != 1 || hashSize != sha512.Size384 || proofSize != sha512.Size384 {
 		t.Fatalf("unexpected suite constants: version=%d hash=%d proof=%d", Version, hashSize, proofSize)
 	}
 	if serverSize != 6371 || hashSize+proofSize != 96 {
 		t.Fatalf("unexpected payload sizes: server=%d finish=%d", serverSize, hashSize+proofSize)
 	}
-	if helloSize != 1792 || transcriptSize != 3507 || transcriptSize <= hashSize {
+	if helloSize != 1768 || transcriptSize != 3483 || transcriptSize <= hashSize {
 		t.Fatalf("unexpected transcript size: %d", transcriptSize)
 	}
 }
@@ -340,15 +343,79 @@ func TestDeriveKnownAnswer(t *testing.T) {
 	for i := range hash {
 		hash[i] = byte(0x80 + i)
 	}
-	next, psk, confirmation, err := derive(State{}, ss, hash)
+	next, psk, confirmation, err := derive(State{}, 0, ss, hash)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !next.valid || next.Epoch != 0 || next.Transcript != hash || next.Root == [hashSize]byte{} {
+	if !next.valid || next.Epoch != 0 || next.Transcript != hash {
 		t.Fatal("initial root state was not derived")
 	}
-	if psk == [32]byte{} || confirmation == [32]byte{} || psk == confirmation {
-		t.Fatal("derived traffic and confirmation keys are not independently usable")
+	for name, test := range map[string]struct {
+		got  []byte
+		want string
+	}{
+		"root":         {next.Root[:], "bd22b207298b1a9279e30b1505bd0bb7a92183eefdf4cc719d46e47b74f2b10c8aa31c67be86b458e2bddb1e2f69c36b"},
+		"psk":          {psk[:], "2eecdd4154c601037c071164dbb0b7cd60aa2715c731bc54d18b69e6ade91578"},
+		"confirmation": {confirmation[:], "265032b01c15dca6d531597c85084db1fea7dc9bba44757f5d37835e5c848134"},
+	} {
+		if encoded := hex.EncodeToString(test.got); encoded != test.want {
+			t.Fatalf("%s = %s, want %s", name, encoded, test.want)
+		}
+	}
+	secondSS := make([]byte, 32)
+	var secondHash [hashSize]byte
+	for i := range secondSS {
+		secondSS[i] = byte(32 + i)
+	}
+	for i := range secondHash {
+		secondHash[i] = byte(0xc0 + i)
+	}
+	second, secondPSK, secondConfirmation, err := derive(next, 1, secondSS, secondHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, test := range map[string]struct {
+		got  []byte
+		want string
+	}{
+		"second root":         {second.Root[:], "6c90e54eb8d37f25661dcf002b07e6b2311f72cfca94d3f788b5fd931a8598f8a1761dabb255840491f837624a1e0303"},
+		"second psk":          {secondPSK[:], "e8feaa16e685c40b9df0de80e69c72ae6f6274eeffe0e164e46e916432cbc7a9"},
+		"second confirmation": {secondConfirmation[:], "ae33cd87224ce67c8bfb0e1222550e9912b550eb5151ee1fe5ae2a5dcd2138f2"},
+	} {
+		if encoded := hex.EncodeToString(test.got); encoded != test.want {
+			t.Fatalf("%s = %s, want %s", name, encoded, test.want)
+		}
+	}
+}
+
+func TestRenewalRootBindsEveryInput(t *testing.T) {
+	ss := bytes.Repeat([]byte{1}, 32)
+	hash := [hashSize]byte{2}
+	parent := State{Epoch: 7, Transcript: [hashSize]byte{3}, Root: [hashSize]byte{4}, valid: true}
+	epoch := uint64(8)
+	want, wantPSK, _, err := derive(parent, epoch, ss, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]func(*State, *uint64, []byte, *[hashSize]byte){
+		"previous root":       func(s *State, _ *uint64, _ []byte, _ *[hashSize]byte) { s.Root[0]++ },
+		"previous transcript": func(s *State, _ *uint64, _ []byte, _ *[hashSize]byte) { s.Transcript[0]++ },
+		"epoch":               func(_ *State, e *uint64, _ []byte, _ *[hashSize]byte) { *e++ },
+		"shared secret":       func(_ *State, _ *uint64, ss []byte, _ *[hashSize]byte) { ss[0]++ },
+		"new transcript":      func(_ *State, _ *uint64, _ []byte, h *[hashSize]byte) { h[0]++ },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			changedParent, changedEpoch, changedSS, changedHash := parent, epoch, append([]byte(nil), ss...), hash
+			mutate(&changedParent, &changedEpoch, changedSS, &changedHash)
+			got, gotPSK, _, err := derive(changedParent, changedEpoch, changedSS, changedHash)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Root == want.Root || gotPSK == wantPSK {
+				t.Fatalf("changing %s did not change both root and PSK", name)
+			}
+		})
 	}
 }
 
@@ -367,7 +434,8 @@ func TestRenewalRatchetBindsParentAndEpoch(t *testing.T) {
 	installed.Installed(true)
 
 	// A renewal carrying the committed state advances the ratchet exactly once.
-	renewal, renewedHello, err := NewClientWithState(ctx, first.identity, software.NewKEM, first.serverPublic, Keys{WG: src, Disco: [32]byte{1}}, first.keys, first.State(), now.Add(time.Second))
+	local := Keys{WG: src, Disco: [32]byte(first.hello[clientDiscoOffset : clientDiscoOffset+32])}
+	renewal, renewedHello, err := NewClientWithState(ctx, first.identity, software.NewKEM, first.serverPublic, local, first.keys, first.State(), now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,13 +449,51 @@ func TestRenewalRatchetBindsParentAndEpoch(t *testing.T) {
 
 	// A zero-state client cannot reset the same node to epoch zero, and a valid
 	// state cannot skip directly to a different parent transcript.
-	stale, staleHello, err := NewClient(ctx, first.identity, software.NewKEM, first.serverPublic, Keys{WG: src, Disco: [32]byte{1}}, first.keys, now.Add(2*time.Second))
+	stale, staleHello, err := NewClient(ctx, first.identity, software.NewKEM, first.serverPublic, local, first.keys, now.Add(2*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer stale.Close()
 	if reply, session := s.Handle(ctx, src, staleHello, now.Add(2*time.Second)); reply != nil || session != nil {
 		t.Fatal("stale epoch zero accepted after commitment")
+	}
+}
+
+func TestRenewalRecoversAfterServerStateLoss(t *testing.T) {
+	s, first, hello, src, now := fixture(t)
+	ctx := context.Background()
+	reply, _ := s.Handle(ctx, src, hello, now)
+	_, finish, err := first.Complete(ctx, reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ack, installed := s.Handle(ctx, src, finish, now)
+	installed.Installed(true)
+	if !first.Accepted(ack) {
+		t.Fatal("initial state did not commit")
+	}
+
+	local := Keys{WG: src, Disco: [32]byte(first.hello[clientDiscoOffset : clientDiscoOffset+32])}
+	renewal, renewedHello, err := NewClientWithState(ctx, first.identity, software.NewKEM, first.serverPublic, local, first.keys, first.State(), now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer renewal.Close()
+	// A restarted server retains its identity/configuration but no lease-coupled
+	// ratchet state. Its zero-root proof authenticates that reset to the client.
+	restarted := &Server{Identity: s.Identity, Public: s.Public, Keys: s.Keys, Authorized: s.Authorized}
+	reply, _ = restarted.Handle(ctx, src, renewedHello, now.Add(time.Second))
+	psk, finish, err := renewal.Complete(ctx, reply)
+	if err != nil || psk == [32]byte{} {
+		t.Fatalf("state-loss recovery failed: %v", err)
+	}
+	ack, installed = restarted.Handle(ctx, src, finish, now.Add(time.Second))
+	if installed == nil {
+		t.Fatal("reset candidate was not installable")
+	}
+	installed.Installed(true)
+	if !renewal.Accepted(ack) || renewal.State().Epoch != 1 {
+		t.Fatal("reset state did not retain the client's epoch")
 	}
 }
 
