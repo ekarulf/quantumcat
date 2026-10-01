@@ -152,6 +152,7 @@ func moshEnvironment(env []string, key string) []string {
 
 func mosh(parent context.Context, s config.Store, args []string) error {
 	f := flags("mosh")
+	verbose := f.Bool("verbose", false, "log transport and NAT traversal diagnostics to stderr")
 	host := f.String("ssh-host", "", "SSH destination/alias (defaults to peer name)")
 	serverPort := f.Int("server-port", 0, "optional fixed remote port; default lets mosh-server choose")
 	tunnelPort := f.Int("tunnel-port", 0, "published tunnel port (defaults to the port reported by mosh-server)")
@@ -210,7 +211,7 @@ func mosh(parent context.Context, s config.Store, args []string) error {
 		return err
 	}
 	defer c.Close()
-	c.Logf = func(string, ...any) {}
+	c.Logf = transportLogf(*verbose)
 	if _, err = c.Ping(ctx); err != nil {
 		return err
 	}

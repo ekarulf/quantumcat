@@ -272,6 +272,12 @@ automatically. To stamp a tag into a local build, set `VERSION`:
 make build VERSION=v0.1.0
 ```
 
+Use `--verbose` on `serve`, `forward`, `socks`, `connect`, `up`, or `mosh` to
+write transport diagnostics, including `portmapper:` messages, to stderr.
+Place it before positional arguments, for example
+`qcat serve --verbose --tcp 22=127.0.0.1:22` or
+`qcat connect --verbose outpost 22`. Logging stays quiet by default.
+
 On supported Apple Silicon Macs:
 
 ```sh
