@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -25,8 +26,10 @@ import (
 	"github.com/ekarulf/quantumcat/internal/tunnel"
 	"github.com/ekarulf/quantumcat/internal/version"
 	"github.com/tailscale/tailcat"
+	_ "tailscale.com/feature/condregister/portmapper"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
 	"tailscale.com/wgengine/filter"
 )
 
@@ -53,6 +56,7 @@ qcat version
 
 Pair identity show output out of band; serve --export includes public reachability.
 Flags for each command precede positional arguments. Ctrl-C closes the tunnel.
+Use --verbose on serve, forward, socks, connect, up, or mosh for transport logs on stderr.
 `
 
 // help prefixes the usage text with the running build, so a bug report that
@@ -75,6 +79,14 @@ func flags(name string) *flag.FlagSet {
 	f.SetOutput(os.Stderr)
 	return f
 }
+
+func transportLogf(verbose bool) logger.Logf {
+	if verbose {
+		return log.New(os.Stderr, "qcat: ", log.LstdFlags).Printf
+	}
+	return logger.Discard
+}
+
 func run(ctx context.Context, args []string) error {
 	f := flags("qcat")
 	dir := f.String("config", config.DefaultDir(), "configuration directory")
@@ -220,6 +232,7 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	f := flags("serve")
+	verbose := f.Bool("verbose", false, "log transport and NAT traversal diagnostics to stderr")
 	var tcp, udp, allow repeated
 	f.Var(&tcp, "tcp", "PORT=HOST:PORT (repeatable)")
 	f.Var(&udp, "udp", "UDP PORT=HOST:PORT or FIRST:LAST=HOST:BASE (repeatable, explicit destinations only)")
@@ -319,7 +332,7 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 	}
 	server.RegionID = tailcfg.DERPRegionID(*region)
 	server.DERPMapURL = *dm
-	server.Logf = func(string, ...any) {}
+	server.Logf = transportLogf(*verbose)
 	if len(udpTargets) > 0 {
 		server.OnUDP, err = proxy.UDPServices(ctx, udpTargets)
 		if err != nil {
@@ -397,6 +410,7 @@ func client(ctx context.Context, s config.Store, command string, args []string) 
 	ctx, cancel := clientContext(ctx)
 	defer cancel()
 	f := flags(command)
+	verbose := f.Bool("verbose", false, "log transport and NAT traversal diagnostics to stderr")
 	listen := f.String("listen", "127.0.0.1:1080", "local SOCKS listen address")
 	udp := f.Bool("udp", false, "forward UDP using LOCALPORT:TUNNELPORT")
 	udpIdle := f.Duration("udp-idle-timeout", proxy.DefaultUDPIdleTimeout, "close inactive UDP flows after this duration")
@@ -442,7 +456,7 @@ func client(ctx context.Context, s config.Store, command string, args []string) 
 		return err
 	}
 	defer c.Close()
-	c.Logf = func(string, ...any) {}
+	c.Logf = transportLogf(*verbose)
 	var tun *tunnel.Tunnel
 	if command == "up" {
 		if len(args) != 1 {
