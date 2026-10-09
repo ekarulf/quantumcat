@@ -209,6 +209,80 @@ func TestTunnelAuthenticationLossAndRevocation(t *testing.T) {
 	t.Fatal("revoked WireGuard peer remained installed")
 }
 
+// TestDisconnectAuthenticatedClient covers the upstream disconnect API with
+// Quantumcat's bootstrap, per-peer PSK, and real-TUN route callbacks.
+func TestDisconnectAuthenticatedClient(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	relay := derpserver.New(key.NewNode(), t.Logf)
+	httpRelay := httptest.NewTLSServer(derpserver.Handler(relay))
+	t.Cleanup(func() { relay.Close(); httpRelay.Close() })
+	stun, closeSTUN := stuntest.ServeWithPacketListener(t, nettype.Std{})
+	defer closeSTUN()
+	si, _ := software.Generate()
+	ci, _ := software.Generate()
+	sp, _ := si.PublicKey(ctx)
+	cp, _ := ci.PublicKey(ctx)
+	server := Server(si, sp, key.NewNode(), func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(cp), cp) })
+	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{
+		Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none",
+		DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: stun.Port, STUNTestIP: "127.0.0.1", InsecureForTests: true,
+	}}}
+	var allow atomic.Bool
+	allow.Store(true)
+	server.AllowClient = func(key.NodePublic) bool { return allow.Load() }
+	var adds, removes atomic.Int32
+	server.OnTunnelPeer = func(_ key.NodePublic, add bool) error {
+		if add {
+			adds.Add(1)
+		} else {
+			removes.Add(1)
+		}
+		return nil
+	}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := Client(ci, software.NewKEM, sp, server.TailcatAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if adds.Load() != 1 {
+		t.Fatal("authenticated peer route was not installed")
+	}
+	allow.Store(false)
+	if !server.DisconnectClient(client.PublicKey()) {
+		t.Fatal("authenticated client was not disconnected")
+	}
+	if server.DisconnectClient(client.PublicKey()) {
+		t.Fatal("disconnected client remained installed")
+	}
+	if removes.Load() != 1 {
+		t.Fatal("authenticated peer route was not removed exactly once")
+	}
+	if len(server.Status().Peer) != 0 {
+		t.Fatal("disconnected client remained in the network map")
+	}
+	probeCtx, stopProbe := context.WithTimeout(ctx, 300*time.Millisecond)
+	if err := client.Probe(probeCtx); err == nil {
+		t.Fatal("disconnected client still had an encrypted data path")
+	}
+	stopProbe()
+	renewalCtx, stopRenewal := context.WithTimeout(ctx, time.Second)
+	defer stopRenewal()
+	if err := client.Renew(renewalCtx); err == nil {
+		t.Fatal("disconnected client renewed despite rejected admission")
+	}
+	if len(server.Status().Peer) != 0 || adds.Load() != 1 {
+		t.Fatal("rejected renewal reinstalled disconnected peer")
+	}
+}
+
 // memoryTUN exercises the real WireGuard device's TUN packet path without
 // changing the test host's routes or requiring root.
 type memoryTUN struct {

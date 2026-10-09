@@ -119,3 +119,106 @@ func (c *Client) Renew(ctx context.Context) error {
 	lb.sys.Engine.Get().MarkDevicePeerForHandshake(lb.serverPub)
 	return nil
 }
+
+// Admission is bounded independently of the bootstrap packet queue, so a
+// blocked user hook cannot accumulate an unbounded number of goroutines/PSKs.
+const maxPendingAdmissions = 64
+
+type bootstrapAdmission struct {
+	src       key.NodePublic
+	region    tailcfg.DERPRegionID
+	reply     []byte
+	peer      *AuthenticatedPeer
+	cancelled bool // guarded by peerLifecycleMu
+}
+
+func (j *bootstrapAdmission) finish(installed bool) {
+	if j.peer == nil {
+		return
+	}
+	clear(j.peer.PSK[:])
+	if j.peer.Installed != nil {
+		j.peer.Installed(installed)
+	}
+}
+
+// completeBootstrapLocked commits an admission or renewal on the shared
+// bootstrap worker. peerLifecycleMu remains held through route installation,
+// the installation callback, and acknowledgement, so disconnect cannot remove
+// a route before a pending installation adds it.
+func (b *locoBackend) completeBootstrapLocked(j *bootstrapAdmission) {
+	select {
+	case <-b.bootstrapDone:
+		j.finish(false)
+		return
+	default:
+	}
+	peer := j.peer
+	if peer != nil {
+		if peer.PSK.IsZero() || peer.Valid == nil || !peer.Valid() {
+			j.finish(false)
+			return
+		}
+		b.mu.Lock()
+		_, exists := b.peerPSKs[j.src]
+		if exists {
+			n := b.clients[j.src]
+			valid := b.peerValid[j.src]
+			// Renewal only refreshes an active session with the same identity and
+			// discovery key; it never recreates the device or application sockets.
+			ok := peer.Identity != [32]byte{} && b.peerOwners[j.src] == peer.Identity &&
+				n != nil && n.DiscoKey == peer.Disco && valid != nil && valid()
+			if ok {
+				b.peerPSKs[j.src] = peer.PSK
+				b.peerValid[j.src] = peer.Valid
+				b.peerInstalled[j.src] = time.Now()
+			}
+			b.mu.Unlock()
+			if !ok {
+				j.finish(false)
+				return
+			}
+			b.sys.Engine.Get().SyncDevicePeer(j.src)
+		} else {
+			oldest, owned := oldestSessionForIdentity(b.peerOwners, b.peerInstalled, peer.Identity)
+			if owned >= maxSessionsPerIdentity {
+				b.mu.Unlock()
+				b.removeAuthenticatedPeer(oldest)
+				if b.tunnelPeer != nil {
+					if err := b.tunnelPeer(oldest, false); err != nil {
+						b.logf("removing evicted tunnel peer: %v", err)
+					}
+				}
+				b.mu.Lock()
+			}
+			if len(b.peerPSKs) >= 4096 {
+				b.mu.Unlock()
+				j.finish(false)
+				return
+			}
+			b.peerPSKs[j.src] = peer.PSK
+			b.peerValid[j.src] = peer.Valid
+			b.peerOwners[j.src] = peer.Identity
+			b.peerInstalled[j.src] = time.Now()
+			b.addClientLocked(j.src, peer.Disco)
+			b.mu.Unlock()
+			if b.tunnelPeer != nil {
+				if err := b.tunnelPeer(j.src, true); err != nil {
+					b.removeAuthenticatedPeer(j.src)
+					j.finish(false)
+					return
+				}
+			}
+		}
+		j.finish(true)
+	}
+	if len(j.reply) > 0 {
+		b.sys.MagicSock.Get().SendDERPPacketTo(j.src, j.region, j.reply)
+	}
+}
+
+// A cancelled legacy hook retains its slot until it returns, preventing a
+// retry from starting a second hook for the same key.
+type legacyAdmission struct {
+	cancelled bool // guarded by locoBackend.mu
+}

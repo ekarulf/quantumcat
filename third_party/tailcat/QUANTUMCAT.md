@@ -1,7 +1,7 @@
 # Upstream provenance
 
 Networking library subset from github.com/tailscale/tailcat main,
-commit 72411995d2aabc795742be66db951eeb5fb9ce25. BSD-3-Clause license retained.
+commit 52fbad323e9d352f1febb623e0975368e9a8cbdd. BSD-3-Clause license retained.
 Optional SSH/file-server and CLI code is omitted.
 
 Quantumcat modifications add a bounded DERP bootstrap callback, disable Meow
@@ -23,3 +23,17 @@ Renewal updates an existing peer's PSK and validity callback in place, checks
 its PQ identity owner and discovery key, and retains active WireGuard traffic
 keys and sockets. Client.Renew schedules a fresh WireGuard handshake after
 installing the acknowledged PSK; it does not recreate the device or netstack.
+
+The upstream AllowClient hook also gates authenticated peer installation.
+DisconnectClient clears authentication, PSK, and validity state, synchronizes
+the WireGuard device, and removes real-TUN peer routes through OnTunnelPeer.
+The local module manifest is tidied for the retained networking subset.
+
+Authenticated admission hooks run off the bootstrap worker with one pending
+decision per key and at most 64 pending decisions. Expiry and renewal continue
+while a hook is blocked; shutdown rejects pending installs without waiting for
+the hooks. Install, disconnect, eviction, and expiry serialize peer state and
+route callbacks so a removed peer cannot acquire a late route.
+Legacy admissions retain their per-key slot until the hook returns, and reject
+stale approval after disconnect or shutdown. A fresh retry consults the policy
+again after the cancelled hook has finished.
