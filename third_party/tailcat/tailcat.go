@@ -331,6 +331,10 @@ func NewPrivateKey() *PrivateKey {
 // but there's no controlclient involved, because there's
 // no control plane.
 type locoBackend struct {
+	// peerLifecycleMu orders complete installations, including route callbacks,
+	// against disconnection, eviction, and expiry. Admission hooks never hold it.
+	peerLifecycleMu  sync.Mutex
+	admissions       map[key.NodePublic]*bootstrapAdmission // guarded by peerLifecycleMu
 	bootstrapStopped chan struct{}
 	bootstrapClose   func()
 	tunDevice        tun.Device
@@ -338,7 +342,6 @@ type locoBackend struct {
 	peerValid        map[key.NodePublic]func() bool
 	peerOwners       map[key.NodePublic][32]byte
 	peerInstalled    map[key.NodePublic]time.Time
-	nextClientID     int
 	bootstrapDone    chan struct{}
 	authenticated    bool
 	peerPSKs         map[key.NodePublic]PresharedKey
@@ -364,12 +367,18 @@ type locoBackend struct {
 	// peer map lookup. Set before createEngine.
 	onDERPRecv func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool
 
-	mu             sync.Mutex
-	clients        map[key.NodePublic]*tailcfg.Node // for the server
-	nm             *netmap.NetworkMap
-	allowedClients map[key.NodePublic]bool // or nil map for all
-	eps            []netip.AddrPort        // our current local UDP endpoints, sorted
-	closeOnce      sync.Once
+	// allowClient is the server's [Server.AllowClient] hook, or nil
+	// to allow all clients. Set before Start.
+	allowClient func(key.NodePublic) bool
+
+	mu           sync.Mutex
+	clients      map[key.NodePublic]*tailcfg.Node    // for the server
+	nextClientID tailcfg.NodeID                      // for the server; never reused after a removal
+	pendingAllow map[key.NodePublic]*legacyAdmission // client keys with an allowClient call in flight
+	nm           *netmap.NetworkMap
+	eps          []netip.AddrPort // our current local UDP endpoints, sorted
+	closeOnce    sync.Once
+	closed       bool // guarded by mu; rejects late legacy hook results
 }
 
 const maxSessionsPerIdentity = 16
@@ -402,6 +411,12 @@ func (b *locoBackend) derpRegionID() tailcfg.DERPRegionID {
 
 func (b *locoBackend) Close() error {
 	b.closeOnce.Do(func() {
+		b.mu.Lock()
+		b.closed = true
+		for _, job := range b.pendingAllow {
+			job.cancelled = true
+		}
+		b.mu.Unlock()
 		if b.bootstrapDone != nil {
 			close(b.bootstrapDone)
 			<-b.bootstrapStopped
@@ -453,6 +468,8 @@ type Server struct {
 	BootstrapClose   func()
 	// TUN enables IP mode. OnTunnelPeer installs/removes only an authenticated
 	// peer's host route. It must be set together with TUN.
+	// Route callbacks are serialized with peer installation and disconnection;
+	// they must not synchronously call DisconnectClient or Close.
 	TUN          tun.Device
 	OnTunnelPeer func(key.NodePublic, bool) error
 	// Bootstrap replaces legacy Meow authorization when non-nil.
@@ -498,11 +515,30 @@ type Server struct {
 	// process-wide in-memory cache is used.
 	DERPMapCache DERPMapCache
 
-	// AllowedClients, if non-empty, restricts which client node keys
-	// may connect; all others are silently ignored. If empty, all
-	// clients are allowed. See [Server.AddAllowedClient] to add more
-	// at runtime.
-	AllowedClients []key.NodePublic
+	// AllowClient, if non-nil, reports whether the client with node
+	// key k may connect. It is consulted when a client that is not
+	// already connected announces itself. A client it rejects is
+	// silently ignored and is asked about again if it retries, which
+	// clients do about once a second while trying to connect. If nil,
+	// all clients are allowed.
+	//
+	// It is called without any server lock held and may block, for
+	// example on a lookup in another service, and may call other
+	// Server methods. A slow answer delays only that client, and at
+	// most one call per key is in flight at a time. Because a rejected
+	// client keeps retrying, an expensive hook should remember its
+	// negative answers itself.
+	//
+	// AllowClient decides admission only; it is not asked again about
+	// a connected client. Use [Server.DisconnectClient] to drop one.
+	// For a fixed or hand-maintained list of keys, use a [KeySet]:
+	//
+	//	var allow tailcat.KeySet
+	//	allow.Add(k)
+	//	s.AllowClient = allow.Contains
+	//
+	// It must be set before calling Start.
+	AllowClient func(k key.NodePublic) bool
 
 	lb *locoBackend // non-nil once Start has been called
 
@@ -620,9 +656,15 @@ const DefaultUDPIdleTimeout = 2 * time.Minute
 // It returns an error if the server was already started, including
 // implicitly by [Server.Listen].
 func (s *Server) Start() error {
+	return s.StartContext(context.Background())
+}
+
+// StartContext is Start with a context bounding relay discovery and startup.
+// Cancelling ctx after startup does not stop the server; use Close instead.
+func (s *Server) StartContext(ctx context.Context) error {
 	s.startMu.Lock()
 	defer s.startMu.Unlock()
-	return s.startLocked(context.Background())
+	return s.startLocked(ctx)
 }
 
 // startLocked implements Start, with ctx bounding the startup network
@@ -672,9 +714,7 @@ func (s *Server) startLocked(ctx context.Context) error {
 	lb.logf = logf
 	lb.dm = &tailcfg.DERPMap{}
 	mak.Set(&lb.dm.Regions, reg.RegionID, reg)
-	for _, k := range s.AllowedClients {
-		mak.Set(&lb.allowedClients, k, true)
-	}
+	lb.allowClient = s.AllowClient
 
 	sys := &lb.sys
 	bus := eventbus.New()
@@ -713,6 +753,11 @@ func (s *Server) startLocked(ctx context.Context) error {
 		packet []byte
 	}
 	inbox := make(chan incoming, 64)
+	type admissionResult struct {
+		job     *bootstrapAdmission
+		allowed bool
+	}
+	admitted := make(chan admissionResult, maxPendingAdmissions)
 	var inboxMu sync.Mutex
 	queuedBySource := make(map[key.NodePublic]int)
 	if s.Bootstrap != nil {
@@ -720,6 +765,14 @@ func (s *Server) startLocked(ctx context.Context) error {
 		lb.bootstrapStopped = make(chan struct{})
 		go func() {
 			defer close(lb.bootstrapStopped)
+			defer func() {
+				lb.peerLifecycleMu.Lock()
+				defer lb.peerLifecycleMu.Unlock()
+				for k, job := range lb.admissions {
+					job.finish(false)
+					delete(lb.admissions, k)
+				}
+			}()
 			ticker := time.NewTicker(time.Second)
 			defer ticker.Stop()
 			for {
@@ -731,6 +784,7 @@ func (s *Server) startLocked(ctx context.Context) error {
 					if s.BootstrapCleanup != nil {
 						s.BootstrapCleanup()
 					}
+					lb.peerLifecycleMu.Lock()
 					lb.mu.Lock()
 					var removed []key.NodePublic
 					for k, valid := range lb.peerValid {
@@ -760,6 +814,18 @@ func (s *Server) startLocked(ctx context.Context) error {
 							lb.tunnelPeer(k, false)
 						}
 					}
+					lb.peerLifecycleMu.Unlock()
+					continue
+				case result := <-admitted:
+					lb.peerLifecycleMu.Lock()
+					job := result.job
+					delete(lb.admissions, job.src)
+					if result.allowed && !job.cancelled {
+						lb.completeBootstrapLocked(job)
+					} else {
+						job.finish(false)
+					}
+					lb.peerLifecycleMu.Unlock()
 					continue
 				case p = <-inbox:
 					inboxMu.Lock()
@@ -769,85 +835,38 @@ func (s *Server) startLocked(ctx context.Context) error {
 					}
 					inboxMu.Unlock()
 				}
+				// Drop retries while this key's admission hook is in flight. The
+				// protocol callback stays serialized, and no second hook for the key
+				// can race the first one or change its installation callback.
+				lb.peerLifecycleMu.Lock()
+				pending := lb.admissions[p.src] != nil
+				lb.peerLifecycleMu.Unlock()
+				if pending {
+					continue
+				}
 				reply, peer := s.Bootstrap(p.src, p.packet)
-				if peer != nil {
-					finishInstallation := func(installed bool) {
-						clear(peer.PSK[:])
-						if peer.Installed != nil {
-							peer.Installed(installed)
-						}
-					}
-					if peer.PSK.IsZero() || peer.Valid == nil || !peer.Valid() {
-						finishInstallation(false)
-						continue
-					}
-					lb.mu.Lock()
-					_, exists := lb.peerPSKs[p.src]
-					if exists {
-						n := lb.clients[p.src]
-						valid := lb.peerValid[p.src]
-						// Renewal may only refresh an active session belonging to the
-						// same PQ identity and discovery key. Never recreate its sockets.
-						ok := peer.Identity != [32]byte{} && lb.peerOwners[p.src] == peer.Identity &&
-							n != nil && n.DiscoKey == peer.Disco && valid != nil && valid()
-						if ok {
-							lb.peerPSKs[p.src] = peer.PSK
-							lb.peerValid[p.src] = peer.Valid
-							lb.peerInstalled[p.src] = time.Now()
-						}
-						lb.mu.Unlock()
-						if !ok {
-							finishInstallation(false)
-							continue
-						}
-						lb.sys.Engine.Get().SyncDevicePeer(p.src)
-						finishInstallation(true)
-						if len(reply) > 0 {
-							lb.sys.MagicSock.Get().SendDERPPacketTo(p.src, p.region, reply)
-						}
-						continue
-					}
-					oldest, owned := oldestSessionForIdentity(lb.peerOwners, lb.peerInstalled, peer.Identity)
-					if owned >= maxSessionsPerIdentity {
-						lb.mu.Unlock()
-						lb.removeAuthenticatedPeer(oldest)
-						if lb.tunnelPeer != nil {
-							if err := lb.tunnelPeer(oldest, false); err != nil {
-								lb.logf("removing evicted tunnel peer: %v", err)
+				job := &bootstrapAdmission{src: p.src, region: p.region, reply: reply, peer: peer}
+				lb.peerLifecycleMu.Lock()
+				lb.mu.Lock()
+				_, connected := lb.clients[p.src]
+				lb.mu.Unlock()
+				if peer != nil && !connected && lb.allowClient != nil {
+					if peer.PSK.IsZero() || peer.Valid == nil || !peer.Valid() || len(lb.admissions) >= maxPendingAdmissions {
+						job.finish(false)
+					} else {
+						mak.Set(&lb.admissions, p.src, job)
+						go func() {
+							allowed := lb.allowClient(job.src)
+							select {
+							case admitted <- admissionResult{job, allowed}:
+							case <-lb.bootstrapDone:
 							}
-						}
-						lb.mu.Lock()
+						}()
 					}
-					full := len(lb.peerPSKs) >= 4096
-					if !exists && !full {
-						lb.peerPSKs[p.src] = peer.PSK
-						lb.peerValid[p.src] = peer.Valid
-						lb.peerOwners[p.src] = peer.Identity
-						lb.peerInstalled[p.src] = time.Now()
-					}
-					lb.mu.Unlock()
-					clear(peer.PSK[:])
-					if exists || full {
-						finishInstallation(false)
-						continue
-					}
-					if !lb.onMeow(p.src, peer.Disco) {
-						lb.removeAuthenticatedPeer(p.src)
-						finishInstallation(false)
-						continue
-					}
-					if lb.tunnelPeer != nil {
-						if err := lb.tunnelPeer(p.src, true); err != nil {
-							lb.removeAuthenticatedPeer(p.src)
-							finishInstallation(false)
-							continue
-						}
-					}
-					finishInstallation(true)
+				} else {
+					lb.completeBootstrapLocked(job)
 				}
-				if len(reply) > 0 {
-					lb.sys.MagicSock.Get().SendDERPPacketTo(p.src, p.region, reply)
-				}
+				lb.peerLifecycleMu.Unlock()
 			}
 		}()
 	}
@@ -1219,19 +1238,33 @@ func tcpipStackOf(ns *netstack.Impl) *stack.Stack {
 	return reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem().Interface().(*stack.Stack)
 }
 
-// AddAllowedClient adds k as an allowed client.
+// DisconnectClient drops the connected client with node key k, if
+// any, and reports whether it was connected. The server forgets the
+// client and stops routing its traffic in either direction. It does
+// not reset the client's connections: they stall until they time
+// out, and the client's packets are dropped.
 //
-// Until a key is allowed (here or via [Server.AllowedClients]), all
-// clients are allowed.
-func (s *Server) AddAllowedClient(k key.NodePublic) {
+// Nothing stops k from connecting again, so a caller revoking a
+// client should first make [Server.AllowClient] reject it (report
+// false for the key), before disconnecting the client.
+// An in-flight admission is cancelled even if the client has
+// not yet connected (in which case DisconnectClient reports false).
+func (s *Server) DisconnectClient(k key.NodePublic) bool {
 	if s.lb == nil {
-		// Not yet started; applied at Start.
-		s.AllowedClients = append(s.AllowedClients, k)
-		return
+		return false // nothing is connected before Start
 	}
-	s.lb.mu.Lock()
-	defer s.lb.mu.Unlock()
-	mak.Set(&s.lb.allowedClients, k, true)
+	s.lb.peerLifecycleMu.Lock()
+	defer s.lb.peerLifecycleMu.Unlock()
+	if job := s.lb.admissions[k]; job != nil {
+		job.cancelled = true
+	}
+	removed := s.lb.removeAuthenticatedPeer(k)
+	if removed && s.lb.tunnelPeer != nil {
+		if err := s.lb.tunnelPeer(k, false); err != nil {
+			s.lb.logf("removing disconnected tunnel peer: %v", err)
+		}
+	}
+	return removed
 }
 
 // TailcatAddr returns the tailcat address that clients use to connect to this
@@ -1711,6 +1744,29 @@ func (b *locoBackend) peerConfig(k key.NodePublic) (_ wgcfg.PeerConfig, ok bool)
 	return withPSK(n.AllowedIPs), true
 }
 
+// PeerKey returns the node public key of the peer at remote, the
+// remote address of a connection or flow accepted by this server: the
+// net.Conn passed to [Server.OnTCP] or [Server.OnTCPForward], the
+// [ConnPacketConn] passed to [Server.OnUDP] or [Server.OnUDPForward],
+// or a connection from a [Server.Listen] listener.
+//
+// The tunnel has already authenticated the peer by this key, so a
+// caller can tell which peer it is serving: it is the key that
+// [Server.AllowClient] admitted. It reports ok=false if remote is
+// not a known peer's address.
+func (s *Server) PeerKey(remote net.Addr) (_ key.NodePublic, ok bool) {
+	var ap netip.AddrPort
+	switch a := remote.(type) {
+	case *net.TCPAddr:
+		ap = a.AddrPort()
+	case *net.UDPAddr:
+		ap = a.AddrPort()
+	default:
+		return key.NodePublic{}, false
+	}
+	return s.lb.peerByIP(ap.Addr().Unmap())
+}
+
 // peerByIP returns the public key of the peer that outbound packets
 // addressed to dst should be sent to (see
 // [wgengine.Engine.SetPeerByIPPacketFunc]).
@@ -1843,6 +1899,14 @@ func (lb *locoBackend) Start() error {
 	mc := lb.sys.MagicSock.Get()
 	lb.logf("disco pub key: %v", mc.DiscoPublicKey())
 
+	// Mark the network up before SetPrivateKey and SetDERPMap, which
+	// start endpoint updates in the background. With no non-loopback
+	// interface (as in the Nix build sandbox) magicsock starts with
+	// the network down, and an endpoint update that runs while it is
+	// still down skips netcheck and never picks a home DERP. A server
+	// then isn't reachable through DERP until the periodic re-STUN
+	// 20-26s later, long after clients give up.
+	mc.SetNetworkUp(true)
 	mc.SetPrivateKey(lb.priv)
 	mc.SetDERPMap(lb.dm)
 
@@ -1898,7 +1962,6 @@ func (lb *locoBackend) Start() error {
 	mc.SetNetworkMap(nm.SelfNode, nm.Peers)
 	e.SetSelfNode(nm.SelfNode)
 	lb.sys.Netstack.Get().UpdateNetstackIPs(nm)
-	mc.SetNetworkUp(true)
 	lb.logf("NetworkMap: %v", logger.AsJSON(nm))
 
 	// Install the live per-peer config sources. WireGuard peers are
@@ -1934,22 +1997,55 @@ func (lb *locoBackend) Start() error {
 // whether the client is allowed and configured, meaning a "meowed"
 // acknowledgment may be sent.
 func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool {
+	b.logf("got meow from %v", src.String())
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.logf("got meow from %v", src.String())
-	if b.allowedClients != nil && !b.allowedClients[src] {
-		b.logf("ignoring meow from %v: not in allowedClients", src.String())
+	if b.closed {
 		return false
 	}
-
 	if _, ok := b.clients[src]; ok {
 		return true
 	}
+	if b.allowClient != nil {
+		if b.pendingAllow[src] != nil {
+			// An earlier meow from src is still waiting on the
+			// hook. Drop this one; src retries once a second.
+			return false
+		}
+		// Ask the hook with b.mu released: it may block, and it may
+		// call Server methods that take b.mu. pendingAllow keeps a
+		// second meow from src from racing us to add the client.
+		job := &legacyAdmission{}
+		mak.Set(&b.pendingAllow, src, job)
+		b.mu.Unlock()
+		allowed := b.allowClient(src)
+		b.mu.Lock()
+		delete(b.pendingAllow, src)
+		if !allowed || job.cancelled || b.closed {
+			b.logf("ignoring meow from %v: admission rejected or cancelled", src.String())
+			return false
+		}
+	}
+
+	return b.addClientLocked(src, discoPub)
+}
+
+// addClientLocked installs an admitted peer. b.mu must be held.
+func (b *locoBackend) addClientLocked(src key.NodePublic, discoPub key.DiscoPublic) bool {
+	if _, ok := b.clients[src]; ok {
+		return true
+	}
+
+	// The server is ID 1 and clients are IDs 2, 3, and so on. IDs
+	// are never reused: after a removal, len(b.clients)+2 could
+	// collide with a live peer.
+	if b.nextClientID < 2 {
+		b.nextClientID = 2
+	}
+	id := b.nextClientID
 	b.nextClientID++
-	id := b.nextClientID + 1 // server is ID 1; never reuse IDs after revocation.
-	derpRegion := b.derpRegionID()
 	mak.Set(&b.clients, src, &tailcfg.Node{
-		ID:         tailcfg.NodeID(id),
+		ID:         id,
 		StableID:   tailcfg.StableNodeID(fmt.Sprint(id)),
 		Name:       fmt.Sprintf("client%d.tailcat.", id),
 		User:       100,
@@ -1957,9 +2053,25 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 		DiscoKey:   discoPub,
 		Addresses:  []netip.Prefix{pfxOf(tcAddrForKey(src))},
 		AllowedIPs: []netip.Prefix{pfxOf(tcAddrForKey(src))},
-		HomeDERP:   derpRegion,
+		HomeDERP:   b.derpRegionID(),
 	})
+	b.setNetworkMapLocked()
 
+	// No engine reconfig needed: the WireGuard device learns about the
+	// new peer lazily via the config source installed with
+	// SetPeerConfigFunc when the client's handshake arrives.
+
+	// Tell the new client our UDP endpoints so both sides can attempt
+	// a direct path. Async because advertiseEndpoints takes b.mu.
+	go b.advertiseEndpoints()
+	return true
+}
+
+// setNetworkMapLocked rebuilds the server's network map from
+// b.clients and pushes it to magicsock and netstack. b.mu must be
+// held.
+func (b *locoBackend) setNetworkMapLocked() {
+	derpRegion := b.derpRegionID()
 	nm := &netmap.NetworkMap{
 		NodeKey: b.pub,
 		SelfNode: (&tailcfg.Node{
@@ -1982,23 +2094,18 @@ func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool 
 	})
 	b.nm = nm
 
-	mc := b.sys.MagicSock.Get()
-	mc.SetNetworkMap(nm.SelfNode, nm.Peers)
+	b.sys.MagicSock.Get().SetNetworkMap(nm.SelfNode, nm.Peers)
 	b.sys.Netstack.Get().UpdateNetstackIPs(nm)
-
-	// No engine reconfig needed: the WireGuard device learns about the
-	// new peer lazily via the config source installed with
-	// SetPeerConfigFunc when the client's handshake arrives.
-
-	// Tell the new client our UDP endpoints so both sides can attempt
-	// a direct path. Async because advertiseEndpoints takes b.mu.
-	go b.advertiseEndpoints()
-	return true
 }
 
 // removeAuthenticatedPeer rolls back all networking state after a failed install.
-func (b *locoBackend) removeAuthenticatedPeer(k key.NodePublic) {
+// The caller must hold peerLifecycleMu through any accompanying route removal.
+func (b *locoBackend) removeAuthenticatedPeer(k key.NodePublic) bool {
 	b.mu.Lock()
+	_, removed := b.clients[k]
+	if job := b.pendingAllow[k]; job != nil {
+		job.cancelled = true
+	}
 	delete(b.clients, k)
 	delete(b.peerPSKs, k)
 	delete(b.peerValid, k)
@@ -2016,6 +2123,7 @@ func (b *locoBackend) removeAuthenticatedPeer(k key.NodePublic) {
 	}
 	b.mu.Unlock()
 	b.sys.Engine.Get().SyncDevicePeer(k)
+	return removed
 }
 
 func (b *locoBackend) Status() *ipnstate.Status {
@@ -2320,6 +2428,19 @@ func (c *Client) PublicKey() key.NodePublic {
 	c.startMu.Lock()
 	defer c.startMu.Unlock()
 	return c.nodeKeyLocked().Public()
+}
+
+// DERPRegion returns the DERP region the client uses to reach the
+// server, once the client has started (see [Client.Dial] for what
+// starts it). Before then, or if the client failed to start, it
+// returns nil.
+func (c *Client) DERPRegion() *tailcfg.DERPRegion {
+	c.startMu.Lock()
+	defer c.startMu.Unlock()
+	if !c.started || len(c.ci.Region) == 0 {
+		return nil
+	}
+	return c.ci.Region[0]
 }
 
 // Close shuts down the client, closing the WireGuard engine and DERP connections.
