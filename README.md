@@ -171,13 +171,70 @@ mkdir -p "$HOME/.local/bin"
 install -m 755 qcat "$HOME/.local/bin/qcat"
 ```
 
-On macOS, keep `qcat-se` beside `qcat`:
+On macOS, install `qcat-se` outside your `PATH`:
 
 ```sh
-install -m 755 qcat-se "$HOME/.local/bin/qcat-se"
+mkdir -p "$HOME/.local/libexec/qcat"
+install -m 755 qcat-se "$HOME/.local/libexec/qcat/qcat-se"
 ```
 
 macOS binaries are currently ad-hoc signed rather than Developer ID signed/notarized. Checksums protect against accidental corruption; they are not publisher signatures.
+
+### Homebrew and other package layouts
+
+For a Homebrew formula, install the two binaries separately:
+
+```ruby
+bin.install "qcat"
+libexec.install "qcat-se"
+```
+
+Homebrew keeps `libexec` private to the formula instead of linking it into the
+global `bin` or `sbin`. Prefer it to `sbin`, which Homebrew links and which may
+already be on the user's `PATH`. No wrapper or environment variable is needed.
+
+`qcat` resolves its own executable first, so a Homebrew `bin/qcat` or
+`opt/quantumcat/bin/qcat` symlink finds the helper in the same versioned keg.
+That location is pinned at process startup; restart running services after an
+upgrade, before Homebrew removes their old keg.
+When `qcat` is in a `bin` or `sbin` directory, discovery checks these paths in
+order under that installation prefix:
+
+1. `libexec/qcat/qcat-se`
+2. `libexec/qcat-se`
+3. `sbin/qcat-se`
+4. `qcat-se` beside `qcat` (also the only default for other executable locations)
+
+Adjacent release-archive and `make helper` layouts remain supported. The helper
+is never searched for on `PATH`. A missing candidate allows the next layout;
+an existing but unsafe or broken candidate is an error rather than a fallback.
+For a custom location, an unprivileged process may set an absolute
+`QCAT_ENCLAVE_HELPER` path (`QCAT_SE_HELPER` remains a legacy alias).
+
+Helper symlinks are allowed only after validating every traversed directory and
+link and the final executable. The canonical target is then executed. The helper
+must be a regular executable owned by root or the current user, never writable
+by group or others. Directory and link ownership must also be trusted.
+
+For an ordinary unprivileged invocation, group-writable directories shared by
+the resolved `qcat` and helper paths are allowed to accommodate Homebrew's
+admin-group-managed prefixes. This explicitly trusts that installation's group
+to replace both binaries, including helpers started by an already-running
+`qcat`. Helper-only group-writable directories and non-sticky world-writable
+directories are rejected. These are POSIX owner/mode checks, not an ACL audit.
+
+Set-ID invocations (different real/effective user or group IDs) cannot start a
+helper. Ordinary root invocations, including `sudo`, ignore both environment
+overrides and disable the shared-directory exception. Root will not run a helper
+from a normal user-owned Homebrew keg, even if the helper file itself is root-owned.
+For privileged TUN use with Secure Enclave, install `qcat` and its helper into a
+separate root-owned, non-group/other-writable installation rather than changing
+ownership of Homebrew's prefix. Identity and peer-store symlink and permission
+checks are unchanged.
+
+Secure Enclave long-lived private keys remain non-exportable. Helper-path checks
+protect which code can invoke signing operations and use the process's OS
+privileges; they do not change that key-storage design.
 
 ## Pairing
 
