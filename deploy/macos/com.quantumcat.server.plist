@@ -19,7 +19,6 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key><string>REPLACE_HOME</string>
-        <key>QCAT_ENCLAVE_HELPER</key><string>REPLACE_HOME/.local/bin/qcat-se</string>
     </dict>
     <key>StandardOutPath</key><string>REPLACE_HOME/Library/Logs/qcat-server.log</string>
     <key>StandardErrorPath</key><string>REPLACE_HOME/Library/Logs/qcat-server.log</string>
