@@ -311,6 +311,10 @@ qcat down serve
 ```
 
 Client connections periodically re-authenticate with a fresh signed ML-KEM exchange and refresh paths after sleep or network changes.
+Renewal requires the bootstrap DERP relay even when application traffic is direct.
+If the relay stays unavailable through the one-hour server lease, the server
+removes the tunnel. A healthy direct path does not extend that lease. Recovery
+can bootstrap through DERP again; existing application flows may need restarting.
 
 ## Build from source
 

@@ -333,3 +333,79 @@ func TestRenewalCancellationInterruptsInFlightAttempt(t *testing.T) {
 		t.Fatal("renewal blocked shutdown")
 	}
 }
+
+// The current design retains DERP renewal. A healthy direct path does not
+// authorize extending the lease when its bootstrap relay becomes unavailable.
+func TestDirectTunnelExpiresDuringRelayOutage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	relay := derpserver.New(key.NewNode(), t.Logf)
+	httpRelay := httptest.NewTLSServer(derpserver.Handler(relay))
+	defer httpRelay.Close()
+	defer relay.Close()
+	stun, closeSTUN := stuntest.ServeWithPacketListener(t, nettype.Std{})
+	defer closeSTUN()
+	si, _ := software.Generate()
+	defer si.Destroy()
+	ci, _ := software.Generate()
+	defer ci.Destroy()
+	sp, _ := si.PublicKey(ctx)
+	cp, _ := ci.PublicKey(ctx)
+	server := serverWithLifetime(si, sp, key.NewNode(), func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(cp), cp) }, 15*time.Second)
+	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none", DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: stun.Port, STUNTestIP: "127.0.0.1", InsecureForTests: true}}}
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	c, err := Client(ci, software.NewKEM, sp, server.TailcatAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Ping(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Probe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	direct := false
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		for _, p := range c.Status().Peer {
+			direct = p.CurAddr != ""
+		}
+		if direct {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !direct {
+		t.Fatal("test did not establish direct path")
+	}
+	// Stop accepting reconnects as well as closing existing hijacked DERP
+	// connections. CloseClientConnections alone excludes hijacked connections
+	// and leaves the listener open, so a fast reconnect can still renew.
+	httpRelay.Close()
+	relay.Close()
+	probeCtx, stop := context.WithTimeout(ctx, 2*time.Second)
+	if err := c.Probe(probeCtx); err != nil {
+		t.Fatal("direct path failed immediately after relay outage:", err)
+	}
+	stop()
+	renewalCtx, stopRenewal := context.WithTimeout(ctx, time.Second)
+	if err := c.Renew(renewalCtx); err == nil {
+		t.Fatal("renewal unexpectedly succeeded without relay")
+	}
+	stopRenewal()
+	deadline := time.Now().Add(18 * time.Second)
+	for len(server.Status().Peer) > 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(server.Status().Peer) != 0 {
+		t.Fatal("direct traffic extended unauthenticated lease")
+	}
+	probeCtx, stop = context.WithTimeout(ctx, time.Second)
+	defer stop()
+	if err := c.Probe(probeCtx); err == nil {
+		t.Fatal("expired tunnel still carries traffic")
+	}
+}

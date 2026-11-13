@@ -1790,3 +1790,19 @@ Still:
 
 * limit lifetime of shared secrets
 * overwrite byte buffers wher
+
+## Renewal availability decision
+
+The current protocol deliberately keeps signed renewal on the bootstrap DERP
+path. An established direct WireGuard path cannot carry bootstrap frames.
+Clients attempt renewal after 45 minutes; servers remove the peer when its
+one-hour authenticated lease expires. A DERP outage lasting through that expiry
+therefore terminates a healthy direct tunnel. Application traffic and TSMP
+probes do not extend the lease. Relay recovery permits a fresh authenticated
+bootstrap, but existing application flows are not guaranteed to recover.
+
+This retains a relay availability dependency without trusting the relay for
+authentication or confidentiality. It avoids adding an in-band control service
+and its framing, replay, identity binding, revocation, and downgrade surface
+until that protocol can be designed and reviewed. We do not extend leases on
+the basis of unauthenticated liveness. In-band renewal remains future work.
