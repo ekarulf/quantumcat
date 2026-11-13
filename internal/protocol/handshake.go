@@ -169,6 +169,7 @@ type Server struct {
 	limits     map[[32]byte]bucket
 	peerLimits map[[32]byte]bucket
 	global     bucket
+	resolution bucket
 }
 
 // Expire erases pending secrets even when the server receives no traffic.
@@ -226,34 +227,15 @@ func allow(b bucket, now time.Time, max int) (bucket, bool) {
 // unknown identities, and encapsulation follows authentication and replay checks.
 func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now time.Time) ([]byte, *Session) {
 	kind, b, err := Parse(packet)
-	if err != nil {
+	if err != nil || (kind != ClientHello && kind != ClientFinish) {
 		return nil, nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for h, p := range s.pending {
-		if !now.Before(p.expires) {
-			clear(p.hk[:])
-			clear(p.session.PSK[:])
-			delete(s.pending, h)
-		}
-	}
-	for h, t := range s.replay {
-		if !now.Before(t) {
-			delete(s.replay, h)
-		}
-	}
-	for _, limits := range []map[[32]byte]bucket{s.limits, s.peerLimits} {
-		for h, t := range limits {
-			if now.Sub(t.start) > time.Second {
-				delete(limits, h)
-			}
-		}
-	}
 	if kind == ClientFinish {
 		h := [hashSize]byte(b[:hashSize])
 		p := s.pending[h]
-		if p == nil || p.source != source || len(Lookup(s.Authorized, p.session.Peer)) == 0 || !hmac.Equal(proof(p.hk, "client-finished", h), b[hashSize:]) {
+		if p == nil || !now.Before(p.expires) || p.source != source || !hmac.Equal(proof(p.hk, "client-finished", h), b[hashSize:]) || len(Lookup(s.Authorized, p.session.Peer)) == 0 {
 			return nil, nil
 		}
 		ack := frame(ServerAccepted, join(h[:], proof(p.hk, "server-accepted", h)))
@@ -312,6 +294,12 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		return nil, nil
 	}
 	var ok bool
+	// A separate global budget precedes tag enumeration, table eviction and
+	// per-source allocation. Rotating transport keys cannot bypass this bound.
+	s.resolution, ok = allow(s.resolution, now, 128)
+	if !ok {
+		return nil, nil
+	}
 	if s.limits == nil {
 		s.limits = make(map[[32]byte]bucket)
 		s.peerLimits = make(map[[32]byte]bucket)
@@ -330,7 +318,8 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	// recover the real identity by recomputing each authorized peer's tag. One
 	// HMAC per authorized peer is far cheaper than the ML-DSA verification it
 	// gates, and the source bucket above bounds how often an unauthenticated
-	// sender can trigger the scan. Everything downstream uses the real PeerID.
+	// sender can trigger the scan; the global resolution budget also bounds
+	// rotating sources. Everything downstream uses the real PeerID.
 	id, pub := s.resolve(b[:32], b[96:128])
 	if len(pub) == 0 || ID(pub) != id {
 		return nil, nil
@@ -340,10 +329,10 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 		return nil, nil
 	}
 	replay := sha512.Sum384(join(id[:], b[96:128]))
-	if _, ok := s.replay[replay]; ok {
+	if expires, ok := s.replay[replay]; ok && now.Before(expires) {
 		digest := sha512.Sum384(packet)
 		for _, p := range s.pending {
-			if p.source == source && p.helloHash == digest {
+			if now.Before(p.expires) && p.source == source && p.helloHash == digest {
 				return append([]byte(nil), p.response...), nil
 			}
 		}
@@ -367,7 +356,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	}
 	owned := 0
 	for _, p := range s.pending {
-		if p.session.Peer == id {
+		if now.Before(p.expires) && p.session.Peer == id {
 			owned++
 		}
 	}

@@ -273,3 +273,12 @@ There are no acknowledgements or retries. Missing fragments cause loss of that
 datagram, never delivery of a partial message. Complete duplicate datagrams may
 still be delivered; the application owns replay handling. This framing does not
 change the bootstrap or WireGuard protocol.
+
+Unauthenticated CPU work has a separate global token bucket: 128 tag-resolution
+attempts per second (including an initial burst of 128), before source-table
+eviction or peer enumeration. Signature verification retains its separate
+64/second budget. Unknown finishes and server-directed message types perform
+no table sweeps. Full expiry runs through periodic BootstrapCleanup; accesses
+check record expiry explicitly. Memory caps remain enforced even between sweeps.
+Valid finishes bypass the hello budgets; unauthenticated hello floods can still
+consume shared hello capacity, so these bounds are not a fairness guarantee.
