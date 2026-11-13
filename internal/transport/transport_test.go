@@ -48,7 +48,7 @@ func TestInstallationFailureNeverAcknowledged(t *testing.T) {
 	ci, _ := software.Generate()
 	sp, _ := si.PublicKey(ctx)
 	cp, _ := ci.PublicKey(ctx)
-	server := Server(si, sp, key.NewNode(), func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(cp), cp) })
+	server := Server(si, sp, key.NewNode(), protocol.EnumeratedAuthorizations(func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(cp), cp) }))
 	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{
 		Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none",
 		DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: stun.Port, STUNTestIP: "127.0.0.1", InsecureForTests: true,
@@ -102,11 +102,11 @@ func TestTunnelAuthenticationLossAndRevocation(t *testing.T) {
 	sp, _ := si.PublicKey(ctx)
 	cp, _ := ci.PublicKey(ctx)
 	var revoked atomic.Bool
-	server := Server(si, sp, key.NewNode(), func(yield func(protocol.PeerID, []byte) bool) {
+	server := Server(si, sp, key.NewNode(), protocol.EnumeratedAuthorizations(func(yield func(protocol.PeerID, []byte) bool) {
 		if !revoked.Load() {
 			yield(protocol.ID(cp), cp)
 		}
-	})
+	}))
 	server.Region = region
 	server.Logf = t.Logf
 	server.OnTCP = func(p uint16) func(net.Conn) {
@@ -223,7 +223,7 @@ func TestDisconnectAuthenticatedClient(t *testing.T) {
 	ci, _ := software.Generate()
 	sp, _ := si.PublicKey(ctx)
 	cp, _ := ci.PublicKey(ctx)
-	server := Server(si, sp, key.NewNode(), func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(cp), cp) })
+	server := Server(si, sp, key.NewNode(), protocol.EnumeratedAuthorizations(func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(cp), cp) }))
 	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{
 		Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none",
 		DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: stun.Port, STUNTestIP: "127.0.0.1", InsecureForTests: true,
@@ -337,7 +337,7 @@ func TestIPModeHostPackets(t *testing.T) {
 	ci, _ := software.Generate()
 	sp, _ := si.PublicKey(ctx)
 	cp, _ := ci.PublicKey(ctx)
-	server := Server(si, sp, key.NewNode(), func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(cp), cp) })
+	server := Server(si, sp, key.NewNode(), protocol.EnumeratedAuthorizations(func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(cp), cp) }))
 	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none", DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: stun.Port, STUNTestIP: "127.0.0.1", InsecureForTests: true}}}
 	st := newMemoryTUN()
 	server.TUN = st

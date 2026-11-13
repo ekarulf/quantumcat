@@ -305,17 +305,11 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 	for _, p := range paired {
 		authorized[protocol.ID(p.PublicKey)] = p.PublicKey
 	}
-	// Blinded client peer tags make the protocol enumerate authorized identities
-	// rather than index them, so hand it a snapshot iterator over the reloaded
-	// map instead of a lookup callback.
-	server := transport.Server(i, pub, meta.Node, func(yield func(protocol.PeerID, []byte) bool) {
+	snapshot := protocol.NewAuthorizations(authorized)
+	server := transport.Server(i, pub, meta.Node, func() *protocol.AuthorizationSnapshot {
 		mu.RLock()
 		defer mu.RUnlock()
-		for id, key := range authorized {
-			if !yield(id, key) {
-				return
-			}
-		}
+		return snapshot
 	})
 	if *tunMode {
 		tun, err := tunnel.Open()
@@ -402,6 +396,7 @@ func serve(ctx context.Context, s config.Store, args []string) error {
 			next := reloadAuthorizations(s, os.Stderr, &reloadState, authorized)
 			mu.Lock()
 			authorized = next
+			snapshot = protocol.NewAuthorizations(next)
 			mu.Unlock()
 		}
 	}

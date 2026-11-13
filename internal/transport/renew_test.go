@@ -105,11 +105,11 @@ func TestTCPStreamSurvivesRenewalAndLostAcknowledgement(t *testing.T) {
 	sp, _ := si.PublicKey(ctx)
 	cp, _ := ci.PublicKey(ctx)
 	var revoked, wrongOwner atomic.Bool
-	server := serverWithLifetime(si, sp, key.NewNode(), func(yield func(protocol.PeerID, []byte) bool) {
+	server := serverWithLifetime(si, sp, key.NewNode(), protocol.EnumeratedAuthorizations(func(yield func(protocol.PeerID, []byte) bool) {
 		if !revoked.Load() {
 			yield(protocol.ID(cp), cp)
 		}
-	}, lease)
+	}), lease)
 	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{
 		Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none",
 		DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: stun.Port, STUNTestIP: "127.0.0.1", InsecureForTests: true,

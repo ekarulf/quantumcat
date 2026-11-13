@@ -10,7 +10,6 @@ import (
 	"crypto/sha512"
 	"encoding/binary"
 	"errors"
-	"iter"
 	"sync"
 	"time"
 
@@ -159,11 +158,10 @@ type Server struct {
 	Identity provider.Identity
 	Public   []byte
 	Keys     Keys
-	// Authorized enumerates each authorized peer's full PeerID and ML-DSA public
-	// key. It must be served from memory and must omit revoked peers: handshake
-	// processing performs no filesystem enumeration or parsing. Protocol code
-	// only reads the set; it never retains or mutates it.
-	Authorized iter.Seq2[PeerID, []byte]
+	// Authorized returns the current immutable in-memory authority snapshot.
+	// Tag enumeration and known-identity lookup use the same snapshot index.
+	// Publishing a replacement revokes both access paths together.
+	Authorized Authorizations
 	pending    map[[hashSize]byte]*pending
 	replay     map[[hashSize]byte]time.Time
 	limits     map[[32]byte]bucket
@@ -416,7 +414,7 @@ func (s *Server) resolve(tag, nonce []byte) (PeerID, []byte) {
 	if s.Authorized == nil {
 		return PeerID{}, nil
 	}
-	for id, pub := range s.Authorized {
+	for id, pub := range s.Authorized().All() {
 		if candidate := peerTag(id, nonce); hmac.Equal(candidate[:], tag) {
 			return id, pub
 		}

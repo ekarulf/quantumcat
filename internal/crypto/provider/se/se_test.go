@@ -55,7 +55,7 @@ func TestSecureEnclaveStandardLibraryInteroperability(t *testing.T) {
 	rand.Read(local.Disco[:])
 	rand.Read(remote.WG[:])
 	rand.Read(remote.Disco[:])
-	server := &protocol.Server{Identity: si, Public: sp, Keys: remote, Authorized: func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(pub), pub) }}
+	server := &protocol.Server{Identity: si, Public: sp, Keys: remote, Authorized: protocol.EnumeratedAuthorizations(func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(pub), pub) })}
 	defer server.Close()
 	c, hello, err := protocol.NewClient(ctx, h, se.NewKEM, sp, local, remote, time.Now())
 	if err != nil {
@@ -83,7 +83,7 @@ func TestSecureEnclaveStandardLibraryInteroperability(t *testing.T) {
 	rand.Read(clientKeys.Disco[:])
 	rand.Read(serverKeys.WG[:])
 	rand.Read(serverKeys.Disco[:])
-	enclaveServer := &protocol.Server{Identity: h, Public: pub, Keys: serverKeys, Authorized: func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(sp), sp) }}
+	enclaveServer := &protocol.Server{Identity: h, Public: pub, Keys: serverKeys, Authorized: protocol.EnumeratedAuthorizations(func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(sp), sp) })}
 	defer enclaveServer.Close()
 	softwareClient, clientHello, err := protocol.NewClient(ctx, si, software.NewKEM, pub, clientKeys, serverKeys, time.Now())
 	if err != nil {

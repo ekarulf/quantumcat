@@ -89,12 +89,12 @@ func TestPendingQuotaSharedByIdentityAcrossSources(t *testing.T) {
 	defer other.Destroy()
 	pub, _ := other.PublicKey(ctx)
 	authorized := s.Authorized
-	s.Authorized = func(yield func(PeerID, []byte) bool) {
+	s.Authorized = EnumeratedAuthorizations(func(yield func(PeerID, []byte) bool) {
 		if !yield(ID(pub), pub) {
 			return
 		}
-		authorized(yield)
-	}
+		authorized().All()(yield)
+	})
 	c, hello, err := NewClient(ctx, other, software.NewKEM, client.serverPublic, Keys{WG: [32]byte{99}, Disco: [32]byte{1}}, client.keys, now.Add(10*time.Second))
 	if err != nil {
 		t.Fatal(err)

@@ -66,20 +66,51 @@ func peerTag(id PeerID, nonce []byte) [32]byte {
 	return [32]byte(m.Sum(nil)[:32])
 }
 
-// Lookup returns the ML-DSA public key authorized for id, or nil when id is
-// unknown or revoked. Blinded tags already require the server to enumerate its
-// authorized peers, so enumeration is the single authorization interface and no
-// separate lookup callback can drift from it.
-func Lookup(peers iter.Seq2[PeerID, []byte], id PeerID) []byte {
+// AuthorizationSnapshot owns one immutable index for both access paths. Keys
+// are copied on construction and return so callers cannot mutate its authority.
+type AuthorizationSnapshot struct{ peers map[PeerID][]byte }
+type Authorizations func() *AuthorizationSnapshot
+
+func NewAuthorizations(peers map[PeerID][]byte) *AuthorizationSnapshot {
+	s := &AuthorizationSnapshot{peers: make(map[PeerID][]byte, len(peers))}
+	for id, pub := range peers {
+		s.peers[id] = append([]byte(nil), pub...)
+	}
+	return s
+}
+func (s *AuthorizationSnapshot) All() iter.Seq2[PeerID, []byte] {
+	return func(yield func(PeerID, []byte) bool) {
+		if s == nil {
+			return
+		}
+		for id, pub := range s.peers {
+			if !yield(id, append([]byte(nil), pub...)) {
+				return
+			}
+		}
+	}
+}
+func Lookup(peers Authorizations, id PeerID) []byte {
 	if peers == nil {
 		return nil
 	}
-	for candidate, pub := range peers {
-		if candidate == id {
-			return pub
-		}
+	s := peers()
+	if s == nil {
+		return nil
 	}
-	return nil
+	return append([]byte(nil), s.peers[id]...)
+}
+
+// EnumeratedAuthorizations adapts dynamic enumerations, primarily for tests.
+// Production callers should publish a prebuilt snapshot to keep lookup O(1).
+func EnumeratedAuthorizations(peers iter.Seq2[PeerID, []byte]) Authorizations {
+	return func() *AuthorizationSnapshot {
+		m := map[PeerID][]byte{}
+		for id, pub := range peers {
+			m[id] = pub
+		}
+		return NewAuthorizations(m)
+	}
 }
 
 type Keys struct{ WG, Disco [32]byte }
