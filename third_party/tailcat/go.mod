@@ -4,11 +4,11 @@ go 1.27.3
 
 require (
 	github.com/fxamacker/cbor/v2 v2.9.6
-	github.com/tailscale/wireguard-go v0.0.0-20260924224943-0a83b87f7908
+	github.com/tailscale/wireguard-go v0.0.0-20260928213353-e61b6b78110b
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
 	go4.org/netipx v0.0.0-20260823151212-3075585bcbeb
 	gvisor.dev/gvisor v0.0.0-20260915211658-a6f909f08a72
-	tailscale.com v1.103.0-pre.0.20260929142145-a0e471a35b8f
+	tailscale.com v1.105.0-pre.0.20261013225543-fb79793d99f5
 )
 
 require (
@@ -34,6 +34,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.49.0 // indirect
 	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/axiomhq/hyperloglog v0.3.0 // indirect
+	github.com/benbjohnson/immutable v0.4.3 // indirect
+	github.com/bradfitz/reco v0.0.0-20260929154613-b883fbd17e3f // indirect
 	github.com/coder/websocket v1.8.15 // indirect
 	github.com/coreos/go-iptables v0.8.0 // indirect
 	github.com/creachadair/msync v0.10.1 // indirect

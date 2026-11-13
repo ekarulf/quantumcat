@@ -3,10 +3,10 @@ module github.com/ekarulf/quantumcat
 go 1.27.3
 
 require (
-	github.com/tailscale/tailcat v0.7.1-0.20261007201807-52fbad323e9d
-	github.com/tailscale/wireguard-go v0.0.0-20260924224943-0a83b87f7908
+	github.com/tailscale/tailcat v0.7.1-0.20261105151022-e00cdde6ff78
+	github.com/tailscale/wireguard-go v0.0.0-20260928213353-e61b6b78110b
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745
-	tailscale.com v1.103.0-pre.0.20260929142145-a0e471a35b8f
+	tailscale.com v1.105.0-pre.0.20261013225543-fb79793d99f5
 )
 
 require (
