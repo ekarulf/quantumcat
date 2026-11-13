@@ -456,6 +456,7 @@ func client(ctx context.Context, s config.Store, command string, args []string) 
 		return err
 	}
 	defer c.Close()
+	guardClientTrust(ctx, cancel, c, s, args[0], append([]byte(nil), p.PublicKey...))
 	c.Logf = transportLogf(*verbose)
 	var tun *tunnel.Tunnel
 	if command == "up" {

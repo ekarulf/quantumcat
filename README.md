@@ -379,3 +379,10 @@ Contributions, testing on real networks, protocol review, and security analysis 
 ## License
 
 See [LICENSE](LICENSE).
+
+Running clients (`connect`, `forward`, `socks`, `up`, and `mosh`) recheck the
+originally pinned server identity every second and before bootstrap sends and
+after bootstrap completion. Removal, replacement, or an unreadable descriptor
+cancels the connection within one polling interval plus local scheduling and
+filesystem latency. Replacement requires a new connection. This is local
+distrust of a server; to revoke a client remotely, remove it on the server.
