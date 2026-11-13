@@ -273,3 +273,11 @@ There are no acknowledgements or retries. Missing fragments cause loss of that
 datagram, never delivery of a partial message. Complete duplicate datagrams may
 still be delivered; the application owns replay handling. This framing does not
 change the bootstrap or WireGuard protocol.
+
+Authorization uses one immutable map snapshot per published generation. Blinded
+ClientHello tags enumerate that index; finishes and installed-session validity
+checks use expected O(1) known-PeerID lookup in the same index. Snapshot
+replacement applies key changes and revocation to both paths. This is map
+complexity, not constant-time cryptographic comparison. Candidate testing,
+retrospective linkage given a candidate identity, and visible network metadata
+remain unchanged.

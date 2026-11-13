@@ -134,12 +134,12 @@ func TestResolutionDistinguishesTwoRealIdentities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Authorized = func(yield func(PeerID, []byte) bool) {
+	s.Authorized = EnumeratedAuthorizations(func(yield func(PeerID, []byte) bool) {
 		if !yield(ID(firstPub), firstPub) {
 			return
 		}
 		yield(ID(otherPub), otherPub)
-	}
+	})
 	otherSrc := [32]byte{7}
 	otherClient, otherHello, err := NewClient(ctx, other, software.NewKEM, first.serverPublic, Keys{WG: otherSrc, Disco: [32]byte{2}}, first.keys, now)
 	if err != nil {
@@ -231,13 +231,13 @@ func TestServerResolvesTagAmongManyAuthorizedPeers(t *testing.T) {
 	}
 	set := decoys(t, 16)
 	set[ID(pub)] = pub
-	s.Authorized = func(yield func(PeerID, []byte) bool) {
+	s.Authorized = EnumeratedAuthorizations(func(yield func(PeerID, []byte) bool) {
 		for id, key := range set {
 			if !yield(id, key) {
 				return
 			}
 		}
-	}
+	})
 	reply, session := s.Handle(ctx, src, hello, now)
 	if len(reply) == 0 || session != nil {
 		t.Fatal("server failed to resolve a blinded tag against its authorized set")
@@ -396,13 +396,13 @@ func TestRevokedIdentityTagNoLongerResolves(t *testing.T) {
 	}
 	spent := s.peerLimits[[32]byte(ID(pub))]
 	set := decoys(t, 4)
-	s.Authorized = func(yield func(PeerID, []byte) bool) {
+	s.Authorized = EnumeratedAuthorizations(func(yield func(PeerID, []byte) bool) {
 		for id, key := range set {
 			if !yield(id, key) {
 				return
 			}
 		}
-	}
+	})
 	next, renewed, err := NewClient(ctx, c.identity, software.NewKEM, c.serverPublic, Keys{WG: src, Disco: [32]byte{1}}, c.keys, now.Add(time.Second))
 	if err != nil {
 		t.Fatal(err)
@@ -470,4 +470,42 @@ func TestRenewalChangesTagButNotOwner(t *testing.T) {
 		t.Fatal("renewal changed the transport keys")
 	}
 	renewed.Installed(true)
+}
+
+func TestSnapshotLookupAndEnumerationShareRevocation(t *testing.T) {
+	id := PeerID{1}
+	input := map[PeerID][]byte{id: {7}}
+	snapshot := NewAuthorizations(input)
+	input[id][0] = 9
+	authority := func() *AuthorizationSnapshot { return snapshot }
+	if Lookup(authority, id)[0] != 7 {
+		t.Fatal("input mutated snapshot")
+	}
+	key := Lookup(authority, id)
+	key[0] = 8
+	for got, pub := range snapshot.All() {
+		if got != id || pub[0] != 7 {
+			t.Fatal("lookup and enumeration differ")
+		}
+		pub[0] = 3
+	}
+	if Lookup(authority, id)[0] != 7 {
+		t.Fatal("output mutated snapshot")
+	}
+	snapshot = NewAuthorizations(map[PeerID][]byte{id: {2}})
+	if Lookup(authority, id)[0] != 2 {
+		t.Fatal("lookup missed key change")
+	}
+	for _, pub := range snapshot.All() {
+		if pub[0] != 2 {
+			t.Fatal("enumeration missed key change")
+		}
+	}
+	snapshot = NewAuthorizations(nil)
+	if Lookup(authority, id) != nil {
+		t.Fatal("lookup retained revoked identity")
+	}
+	for range snapshot.All() {
+		t.Fatal("enumeration retained revoked identity")
+	}
 }

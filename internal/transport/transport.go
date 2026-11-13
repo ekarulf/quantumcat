@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"iter"
 	"time"
 
 	"github.com/ekarulf/quantumcat/internal/crypto/provider"
@@ -24,11 +23,11 @@ func Keys(node key.NodePrivate) protocol.Keys {
 	disco := tailcat.DiscoPublicForNode(node).Raw32()
 	return protocol.Keys{WG: wg, Disco: disco}
 }
-func Server(identity provider.Identity, pub []byte, node key.NodePrivate, authorized iter.Seq2[protocol.PeerID, []byte]) *tailcat.Server {
+func Server(identity provider.Identity, pub []byte, node key.NodePrivate, authorized protocol.Authorizations) *tailcat.Server {
 	return serverWithLifetime(identity, pub, node, authorized, SessionLifetime)
 }
 
-func serverWithLifetime(identity provider.Identity, pub []byte, node key.NodePrivate, authorized iter.Seq2[protocol.PeerID, []byte], lifetime time.Duration) *tailcat.Server {
+func serverWithLifetime(identity provider.Identity, pub []byte, node key.NodePrivate, authorized protocol.Authorizations, lifetime time.Duration) *tailcat.Server {
 	p := &protocol.Server{Identity: identity, Public: pub, Keys: Keys(node), Authorized: authorized}
 	return &tailcat.Server{
 		BootstrapCleanup:    func() { p.Expire(time.Now()) },

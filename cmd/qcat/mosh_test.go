@@ -222,7 +222,7 @@ func TestMoshSessionWithMockExecutables(t *testing.T) {
 	}
 	si, _ := software.Generate()
 	sp, _ := si.PublicKey(ctx)
-	server := transport.Server(si, sp, key.NewNode(), func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(cp), cp) })
+	server := transport.Server(si, sp, key.NewNode(), protocol.EnumeratedAuthorizations(func(yield func(protocol.PeerID, []byte) bool) { yield(protocol.ID(cp), cp) }))
 	server.Region = &tailcfg.DERPRegion{RegionID: 1, RegionCode: "test", Nodes: []*tailcfg.DERPNode{{Name: "test", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none", DERPPort: httpRelay.Listener.Addr().(*net.TCPAddr).Port, STUNPort: -1, InsecureForTests: true}}}
 	remotePort := echo.LocalAddr().(*net.UDPAddr).Port
 	server.OnUDP, err = proxy.UDPServices(ctx, map[uint16]string{uint16(remotePort): echo.LocalAddr().String()})
