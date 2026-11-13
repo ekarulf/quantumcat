@@ -113,3 +113,12 @@ jobs:
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "$GITHUB_REF_NAME" --draft --generate-notes \
             "${archives[@]}" SHA256SUMS
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body > release-notes.md
+          cat >> release-notes.md <<'CHECKLIST'
+
+          Hardware validation required before publication (docs/RELEASING.md):
+          - [ ] Attach test.json and metadata.txt from validate-enclave-release.sh.
+          - [ ] Confirm exact tag commit, real Apple Silicon, both roles PASS, no skips.
+          - [ ] Record operator and test date; link evidence in these notes.
+          CHECKLIST
+          gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md

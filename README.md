@@ -357,6 +357,9 @@ QuantumCat trusts explicitly paired device identities, not relay infrastructure.
 
 For the details and caveats, read [DESIGN.md](DESIGN.md) and [PROTOCOL.md](PROTOCOL.md).
 
+Release publication also requires the per-commit real Apple Silicon evidence
+in [the release checklist](docs/RELEASING.md). General CI does not satisfy it.
+
 ## Project status
 
 QuantumCat is experimental. The implementation includes automated tests for authentication tampering, replay, identity/source binding, PSK freshness, forwarding policy, revocation, TCP/UDP transport, fragmentation, storage permissions, and local runtime control, but that is not a substitute for independent review.
