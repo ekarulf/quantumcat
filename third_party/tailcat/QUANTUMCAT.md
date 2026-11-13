@@ -1,8 +1,14 @@
 # Upstream provenance
 
 Networking library subset from github.com/tailscale/tailcat main,
-commit 52fbad323e9d352f1febb623e0975368e9a8cbdd. BSD-3-Clause license retained.
+commit e00cdde6ff787f801361ff85ed085775c775d4c5. BSD-3-Clause license retained.
 Optional SSH/file-server and CLI code is omitted.
+
+The update from 52fbad323e9d to e00cdde6ff78 changes upstream dependency and
+build metadata only; no retained upstream Go source changed. Both local module
+manifests use its coordinated Tailscale/WireGuard versions, including the
+Tailscale netstack shutdown fix. The reduced mirror does not carry upstream's
+Nix, release CLI, or optional-feature build-tag configuration.
 
 Quantumcat modifications add a bounded DERP bootstrap callback, disable Meow
 authorization when that callback is configured, gate client WireGuard peer
