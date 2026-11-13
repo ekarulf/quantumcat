@@ -784,9 +784,20 @@ Because the ML-KEM client private key is freshly generated for the connection an
 Each renewal generates another independent ephemeral ML-KEM key. If an attacker
 captures normal process memory and current session keys, then loses access
 before a later renewal begins, the fresh ML-KEM shared secret makes the renewed
-PSK independent of the captured state. After one successful uncompromised
-renewal, that earlier snapshot is insufficient to follow the session. This
-property does not require a persistent root or server-side ratchet state.
+PSK independent of the captured state. PSK bootstrap completion alone does not establish recovery of application
+traffic: `Renew` returns after PSK installation and scheduling a WireGuard
+handshake. Existing send keys can still encrypt traffic, including the first
+outbound packet after return, while that handshake is pending or lost.
+
+The recovery boundary is traffic encrypted with WireGuard keys derived from
+the fresh PSK, after any in-flight handshake using the old PSK has ceased to
+affect the active generation. Old receive keys may remain accepted during
+WireGuard's overlap window, so fresh outbound encryption is also distinct from
+rejecting all packets made with captured old keys. No fixed recovery deadline
+is promised by this API. A newer handshake timestamp or a successful data-path
+probe is diagnostic evidence, not proof of the PSK generation or retirement of
+old receive keys. This property does not require a persistent root or
+server-side ratchet state; the current API does not attest that boundary.
 
 This is recovery from an ended snapshot or offline compromise, not protection
 from continuing endpoint control. An attacker that remains able to execute in

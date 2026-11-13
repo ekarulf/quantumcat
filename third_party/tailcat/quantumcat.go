@@ -88,7 +88,11 @@ type AuthenticatedPeer struct {
 }
 
 // Renew repeats authentication without recreating the device, netstack, node
-// address, or sockets. Existing WireGuard traffic keys survive the PSK update.
+// address, or sockets. Success means fresh PSK installation and scheduling of
+// a WireGuard handshake, not completion of that handshake or retirement of old
+// traffic keys. Existing send and receive keys can survive the PSK update;
+// immediate traffic may use them while a handshake is delayed or lost. Status
+// timestamps and Probe do not attest which PSK generated active traffic keys.
 func (c *Client) Renew(ctx context.Context) error {
 	c.renewMu.Lock()
 	defer c.renewMu.Unlock()

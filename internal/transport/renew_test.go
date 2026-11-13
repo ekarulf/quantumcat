@@ -256,12 +256,15 @@ func TestTCPStreamSurvivesRenewalAndLostAcknowledgement(t *testing.T) {
 	if routeAdds.Load() != 1 || c.PublicKey() != node || conn.LocalAddr().String() != addr {
 		t.Fatal("renewal recreated transport identity or route")
 	}
+	// This checks eventual handshake activity and flow continuity only. An old
+	// in-flight handshake can also advance this timestamp; this is not proof of
+	// the PSK generation or retirement of old receive keys.
 	newHandshake := false
 	for _, peer := range c.Status().Peer {
 		newHandshake = peer.LastHandshake.After(initialHandshake)
 	}
 	if !newHandshake {
-		t.Fatal("renewed PSK never completed a fresh WireGuard handshake")
+		t.Fatal("no later WireGuard handshake observed")
 	}
 
 	// An existing node cannot be taken over by a different authenticated identity.
