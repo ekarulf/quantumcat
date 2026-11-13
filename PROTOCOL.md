@@ -273,3 +273,9 @@ There are no acknowledgements or retries. Missing fragments cause loss of that
 datagram, never delivery of a partial message. Complete duplicate datagrams may
 still be delivered; the application owns replay handling. This framing does not
 change the bootstrap or WireGuard protocol.
+
+Renewal completion means fresh PSK installation and scheduling of a WireGuard
+handshake. It does not attest a traffic-key transition: immediate application
+traffic can still use old send keys; delayed/lost handshake packets extend that
+period, and old receive keys can overlap afterward. See DESIGN §22.6. Neither
+a later handshake timestamp nor a successful probe proves PSK generation.
