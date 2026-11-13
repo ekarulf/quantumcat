@@ -121,3 +121,64 @@ func TestTokenBucketDoesNotResetAtWindowBoundary(t *testing.T) {
 		t.Fatal("backward time refilled bucket")
 	}
 }
+
+func TestCompletedHandshakesDoNotConsumePendingQuota(t *testing.T) {
+	s, client, _, _, now := fixture(t)
+	ctx := context.Background()
+	for n := 0; n < 9; n++ {
+		at := now.Add(time.Duration(n) * 500 * time.Millisecond)
+		src := [32]byte{byte(n + 1)}
+		c, hello, err := NewClient(ctx, client.identity, software.NewKEM, client.serverPublic, Keys{WG: src, Disco: [32]byte{1}}, client.keys, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		reply, _ := s.Handle(ctx, src, hello, at)
+		if len(reply) == 0 {
+			t.Fatalf("hello %d rejected", n+1)
+		}
+		_, finish, err := c.Complete(ctx, reply)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ack, session := s.Handle(ctx, src, finish, at)
+		if session == nil || !c.Accepted(ack) {
+			t.Fatal("finish rejected")
+		}
+		session.Installed(true)
+		ack, duplicate := s.Handle(ctx, src, finish, at)
+		if duplicate != nil || !c.Accepted(ack) {
+			t.Fatal("duplicate reinstalled or lost ack")
+		}
+		c.Close()
+	}
+	if s.unfinished() != 0 {
+		t.Fatal("completed work charged to pending quota")
+	}
+}
+
+func TestCompletedRetryOverflowPreservesUnfinished(t *testing.T) {
+	s, c, hello, src, now := fixture(t)
+	reply, _ := s.Handle(context.Background(), src, hello, now)
+	_, finish, err := c.Complete(context.Background(), reply)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, session := s.Handle(context.Background(), src, finish, now)
+	if session == nil {
+		t.Fatal("no installation")
+	}
+	for n := 0; n < 2048; n++ {
+		var hash [hashSize]byte
+		binary.BigEndian.PutUint64(hash[:], uint64(n+1))
+		s.pending[hash] = &pending{hash: hash, accepted: true, expires: now.Add(-time.Second)}
+	}
+	unfinishedHash := [hashSize]byte{99, 99}
+	s.pending[unfinishedHash] = &pending{hash: unfinishedHash, expires: now.Add(-time.Hour)}
+	session.Installed(true)
+	if len(s.pending) != 2049 || s.pending[unfinishedHash] == nil {
+		t.Fatal("retry overflow evicted unfinished work or exceeded bound")
+	}
+	if ack, again := s.Handle(context.Background(), src, finish, now); again != nil || !c.Accepted(ack) {
+		t.Fatal("new retry record lost")
+	}
+}

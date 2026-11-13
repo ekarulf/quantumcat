@@ -291,6 +291,22 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 				clear(p.session.PSK[:])
 				if ok {
 					p.accepted = true
+					// Retry records have their own bounded capacity. Evict only a
+					// completed record; unfinished work keeps its full quota.
+					completed := 0
+					var oldest *pending
+					for _, entry := range s.pending {
+						if entry.accepted {
+							completed++
+							if oldest == nil || entry.expires.Before(oldest.expires) {
+								oldest = entry
+							}
+						}
+					}
+					if completed > 2048 {
+						clear(oldest.hk[:])
+						delete(s.pending, oldest.hash)
+					}
 				} else {
 					clear(p.hk[:])
 					delete(s.pending, h)
@@ -351,7 +367,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	}
 	// Replay retention covers the full global token budget over five minutes,
 	// including its initial burst. Pending work also has an identity quota.
-	if len(s.replay) >= 64*301 || len(s.pending) >= 256 {
+	if len(s.replay) >= 64*301 || s.unfinished() >= 256 {
 		return nil, nil
 	}
 	hello := b[:helloSize]
@@ -367,7 +383,7 @@ func (s *Server) Handle(ctx context.Context, source [32]byte, packet []byte, now
 	}
 	owned := 0
 	for _, p := range s.pending {
-		if p.session.Peer == id {
+		if !p.accepted && p.session.Peer == id {
 			owned++
 		}
 	}
@@ -435,4 +451,15 @@ func evictOldest(table map[[32]byte]bucket) {
 	if !oldest.IsZero() {
 		delete(table, oldestKey)
 	}
+}
+
+// unfinished excludes bounded acknowledgement retries from admission quotas.
+func (s *Server) unfinished() int {
+	n := 0
+	for _, p := range s.pending {
+		if !p.accepted {
+			n++
+		}
+	}
+	return n
 }
