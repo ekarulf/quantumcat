@@ -381,8 +381,11 @@ func TestDirectTunnelExpiresDuringRelayOutage(t *testing.T) {
 	if !direct {
 		t.Fatal("test did not establish direct path")
 	}
+	// Stop accepting reconnects as well as closing existing hijacked DERP
+	// connections. CloseClientConnections alone excludes hijacked connections
+	// and leaves the listener open, so a fast reconnect can still renew.
+	httpRelay.Close()
 	relay.Close()
-	httpRelay.CloseClientConnections()
 	probeCtx, stop := context.WithTimeout(ctx, 2*time.Second)
 	if err := c.Probe(probeCtx); err != nil {
 		t.Fatal("direct path failed immediately after relay outage:", err)
