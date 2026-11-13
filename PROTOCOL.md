@@ -273,3 +273,7 @@ There are no acknowledgements or retries. Missing fragments cause loss of that
 datagram, never delivery of a partial message. Complete duplicate datagrams may
 still be delivered; the application owns replay handling. This framing does not
 change the bootstrap or WireGuard protocol.
+
+Completed handshake acknowledgement retries do not consume the 256 unfinished
+handshake slots or the eight unfinished handshakes per identity. At most 2,048
+completed retry records are retained; the oldest is evicted on overflow.
