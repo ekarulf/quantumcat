@@ -211,6 +211,7 @@ func mosh(parent context.Context, s config.Store, args []string) error {
 		return err
 	}
 	defer c.Close()
+	guardClientTrust(ctx, cancel, c, s, peerName, append([]byte(nil), p.PublicKey...))
 	c.Logf = transportLogf(*verbose)
 	if _, err = c.Ping(ctx); err != nil {
 		return err
