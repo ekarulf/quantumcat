@@ -1,6 +1,6 @@
 module github.com/ekarulf/quantumcat
 
-go 1.27.3
+go 1.27.4
 
 require (
 	github.com/tailscale/tailcat v0.7.1-0.20261007201807-52fbad323e9d

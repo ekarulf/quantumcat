@@ -314,7 +314,7 @@ Client connections periodically re-authenticate with a fresh signed ML-KEM excha
 
 ## Build from source
 
-Requires Go 1.27.3 or newer.
+Requires Go 1.27.4 or newer.
 
 ```sh
 make build
